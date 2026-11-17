@@ -82,7 +82,7 @@ pub async fn start(core: Arc<Core>) -> Result<LoginStart, String> {
     let open_url = code
         .verification_uri_complete
         .unwrap_or(code.verification_uri);
-    let verification = validate_server_url(&open_url.split('?').next().unwrap_or(&open_url))?;
+    let verification = validate_server_url(open_url.split('?').next().unwrap_or(&open_url))?;
     let actual = url::Url::parse(&open_url).map_err(|_| "Invalid verification URL.")?;
     if verification.origin() != trusted.origin() || actual.origin() != trusted.origin() {
         return Err("Authentication server returned a verification URL on another origin.".into());

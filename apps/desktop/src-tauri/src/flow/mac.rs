@@ -25,10 +25,12 @@ struct HookCtx {
     anchor: (i32, i32),
     residual: (f64, f64),
     keyboard: Option<(i64, bool)>,
+    cursor_hidden: bool,
+    cursor_detached: bool,
+    motion_since: u64,
 }
 static CTX: Mutex<Option<HookCtx>> = Mutex::new(None);
 static FORWARDING: AtomicBool = AtomicBool::new(false);
-static HIDDEN: AtomicBool = AtomicBool::new(false);
 static HEARTBEAT: AtomicU64 = AtomicU64::new(0);
 static EPOCH: OnceLock<Instant> = OnceLock::new();
 static PENDING_DX: AtomicI32 = AtomicI32::new(0);
@@ -76,7 +78,6 @@ const SOURCE_USER_DATA: u32 = 42;
 const SCROLL_CONTINUOUS: u32 = 88;
 const SCROLL_POINTS_1: u32 = 96;
 const SCROLL_POINTS_2: u32 = 97;
-const ENIGO_MARKER: i64 = 100;
 const HID_TAP: u32 = 0;
 const SESSION_TAP: u32 = 1;
 const HEAD_INSERT: u32 = 0;
@@ -104,15 +105,24 @@ pub fn heartbeat() {
     HEARTBEAT.store(now_ms(), Ordering::Relaxed);
 }
 pub fn set_forwarding(value: bool) {
-    let was = FORWARDING.swap(value, Ordering::SeqCst);
-    if was && !value {
-        release_pointer();
+    let mut guard = CTX.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(ctx) = guard.as_mut() {
+        if value {
+            FORWARDING.store(true, Ordering::SeqCst);
+        } else {
+            release_pointer(ctx);
+        }
     }
 }
-fn release_pointer() {
-    ffi::associate(true);
-    if HIDDEN.swap(false, Ordering::SeqCst) {
-        ffi::hide_cursor(false);
+fn release_pointer(ctx: &mut HookCtx) {
+    FORWARDING.store(false, Ordering::SeqCst);
+    take_moves();
+    ctx.residual = (0.0, 0.0);
+    if ctx.cursor_detached && ffi::associate(true) {
+        ctx.cursor_detached = false;
+    }
+    if ctx.cursor_hidden && ffi::hide_cursor(false) {
+        ctx.cursor_hidden = false;
     }
 }
 pub fn with_logic<R>(f: impl FnOnce(&mut CaptureLogic) -> R) -> Option<R> {
@@ -125,49 +135,51 @@ pub fn take_moves() -> (i32, i32) {
         PENDING_DY.swap(0, Ordering::Relaxed),
     )
 }
-fn send(message: Captured) {
-    if let Ok(guard) = CTX.lock() {
-        if let Some(ctx) = guard.as_ref() {
-            let _ = ctx.tx.send(message);
-        }
-    }
-}
 fn modifiers_down() -> impl Iterator<Item = u32> {
     keymap::mac_held_modifiers(ffi::modifier_flags()).filter_map(|kvk| {
         keymap::scan_for_mac(kvk, false).map(|(scan, extended)| super::key_id(scan, extended))
     })
 }
-pub fn begin_forwarding() {
-    take_moves();
-    let anchor = CTX.lock().ok().and_then(|mut guard| {
-        guard.as_mut().map(|ctx| {
-            let anchor = ctx.layout.monitor_for((0, 0)).center();
-            ctx.logic.start_forwarding(anchor);
-            ctx.logic.adopt_local_keys(modifiers_down());
-            ctx.anchor = anchor;
-            ctx.residual = (0.0, 0.0);
-            anchor
-        })
-    });
-    let Some(anchor) = anchor else {
-        return;
-    };
-    heartbeat();
-    ffi::warp(anchor, false);
-    ffi::associate(false);
-    if !HIDDEN.swap(true, Ordering::SeqCst) {
-        ffi::hide_cursor(true);
+pub fn begin_forwarding(session: uuid::Uuid, peer: &str, at: Instant) -> Result<bool, String> {
+    let mut guard = CTX.lock().map_err(|_| TAP_FAILED)?;
+    let ctx = guard.as_mut().ok_or(TAP_FAILED)?;
+    if !INSTALLED.load(Ordering::SeqCst) || STOP.load(Ordering::SeqCst) {
+        return Err(TAP_FAILED.into());
     }
-    set_forwarding(true);
+    let cursor = screen::mac::cursor().map(|point| screen::pointer_location(&ctx.layout, point));
+    if !ctx.logic.still_at_crossing(peer, at, &ctx.layout, cursor) {
+        return Ok(false);
+    }
+    take_moves();
+    let anchor = ctx.layout.monitor_for((0, 0)).center();
+    if !ffi::warp(anchor) {
+        return Err("macOS could not reposition the local pointer for Flow.".into());
+    }
+    ctx.logic.start_forwarding(anchor);
+    ctx.logic.session = Some(session);
+    ctx.logic.adopt_local_keys(modifiers_down());
+    ctx.anchor = anchor;
+    ctx.residual = (0.0, 0.0);
+    heartbeat();
+    if !ctx.cursor_detached {
+        ctx.cursor_detached = ffi::associate(false);
+    }
+    if !ctx.cursor_hidden {
+        ctx.cursor_hidden = ffi::hide_cursor(true);
+    }
+    ctx.motion_since = ffi::current_event_timestamp();
+    FORWARDING.store(true, Ordering::SeqCst);
+    Ok(true)
 }
-pub fn place_cursor(edge: FlowEdge, entry: f64) {
-    let point = CTX.lock().ok().and_then(|guard| {
-        guard
-            .as_ref()
-            .map(|ctx| ctx.layout.entry_point(edge, entry, EDGE_INSET_PX))
-    });
-    if let Some(point) = point {
-        screen::mac::set_cursor(point);
+pub fn place_cursor(peer: &str, edge: FlowEdge, entry: f64) {
+    if let Ok(mut guard) = CTX.lock() {
+        if let Some(ctx) = guard.as_mut() {
+            let point = ctx.layout.entry_point(edge, entry, EDGE_INSET_PX);
+            if screen::mac::set_cursor(point) {
+                ctx.motion_since = ffi::current_event_timestamp();
+                ctx.logic.rearm_after_return(peer, point);
+            }
+        }
     }
 }
 pub fn reinstall() {
@@ -198,38 +210,51 @@ pub fn capture_status() -> Option<CaptureStatus> {
     })
 }
 
-fn handle(
-    injected: bool,
-    build: impl FnOnce(&mut HookCtx, bool) -> Option<RawEvent>,
-) -> bool {
-    let mut forwarding = FORWARDING.load(Ordering::SeqCst);
+fn release_stale(ctx: &mut HookCtx) -> bool {
+    let forwarding = FORWARDING.load(Ordering::SeqCst);
     if forwarding
         && now_ms().saturating_sub(HEARTBEAT.load(Ordering::Relaxed)) > STALE.as_millis() as u64
     {
-        set_forwarding(false);
-        forwarding = false;
+        release_pointer(ctx);
+        let _ = ctx.tx.send(Captured::CaptureStale {
+            session: ctx.logic.session,
+        });
+        return false;
     }
+    forwarding
+}
+
+fn handle(build: impl FnOnce(&mut HookCtx, bool) -> Result<RawEvent, bool>) -> bool {
     let Ok(mut guard) = CTX.lock() else {
         return false;
     };
     let Some(ctx) = guard.as_mut() else {
         return false;
     };
-    let Some(event) = build(ctx, forwarding) else {
-        return forwarding;
+    // Read the forwarding state only after the capture state lock. A return
+    // may have completed while this callback waited for the lock.
+    let forwarding = release_stale(ctx);
+    let event = match build(ctx, forwarding) {
+        Ok(event) => event,
+        Err(swallow) => return swallow,
     };
     let HookCtx {
         logic, tx, layout, ..
     } = ctx;
-    let (verdict, output) = logic.handle(event, injected, forwarding, layout, Instant::now());
+    let (verdict, output) = logic.handle(event, false, forwarding, layout, Instant::now());
     match output {
         Some(Captured::Move { dx, dy }) => {
             PENDING_DX.fetch_add(dx, Ordering::Relaxed);
             PENDING_DY.fetch_add(dy, Ordering::Relaxed);
         }
         Some(Captured::Emergency) => {
-            set_forwarding(false);
             let _ = tx.send(Captured::Emergency);
+            release_pointer(ctx);
+        }
+        Some(Captured::Event(event)) => {
+            if let Some(session) = logic.session {
+                let _ = tx.send(Captured::Forwarded { session, event });
+            }
         }
         Some(other) => {
             let _ = tx.send(other);
@@ -237,19 +262,6 @@ fn handle(
         None => {}
     }
     verdict == Verdict::Swallow
-}
-
-fn take_whole(residual: &mut (f64, f64), (dx, dy): (f64, f64)) -> (i32, i32) {
-    let limit = f64::from(super::MAX_DELTA);
-    let add = |acc: &mut f64, d: f64| {
-        if d.is_finite() {
-            *acc = (*acc + d).clamp(-limit, limit);
-        }
-        let whole = acc.trunc();
-        *acc -= whole;
-        whole as i32
-    };
-    (add(&mut residual.0, dx), add(&mut residual.1, dy))
 }
 
 fn key_event(ctx: &mut HookCtx, kvk: u16, keyboard_type: i64, down: bool) -> RawEvent {
@@ -273,7 +285,24 @@ fn key_event(ctx: &mut HookCtx, kvk: u16, keyboard_type: i64, down: bool) -> Raw
 unsafe fn process(event_type: u32, event: CGEventRef) -> bool {
     let pid = ffi::CGEventGetIntegerValueField(event, SOURCE_PID);
     let injected = pid == i64::from(std::process::id())
-        || ffi::CGEventGetIntegerValueField(event, SOURCE_USER_DATA) == ENIGO_MARKER;
+        || ffi::CGEventGetIntegerValueField(event, SOURCE_USER_DATA) == ffi::INJECTED_MARKER;
+    if injected {
+        // Do not let our posted mouse/key events alter capture residuals,
+        // keyboard state or edge pressure, including late events at handoff.
+        if !matches!(
+            event_type,
+            MOUSE_MOVED | LEFT_DRAGGED | RIGHT_DRAGGED | OTHER_DRAGGED
+        ) {
+            return false;
+        }
+        let timestamp = ffi::CGEventGetTimestamp(event);
+        return CTX.lock().is_ok_and(|guard| {
+            guard.as_ref().is_some_and(|ctx| {
+                FORWARDING.load(Ordering::SeqCst)
+                    || (timestamp != 0 && timestamp < ctx.motion_since)
+            })
+        });
+    }
     match event_type {
         MOUSE_MOVED | LEFT_DRAGGED | RIGHT_DRAGGED | OTHER_DRAGGED => {
             let delta = (
@@ -281,15 +310,29 @@ unsafe fn process(event_type: u32, event: CGEventRef) -> bool {
                 ffi::CGEventGetDoubleValueField(event, DELTA_Y),
             );
             let location = ffi::CGEventGetLocation(event);
-            handle(injected, |ctx, forwarding| {
+            let timestamp = ffi::CGEventGetTimestamp(event);
+            handle(|ctx, forwarding| {
+                // A queued pre-warp motion must not move the cursor back to
+                // its previous corner or trigger the newly rearmed edge.
+                if timestamp != 0 && timestamp < ctx.motion_since {
+                    return Err(true);
+                }
                 let (x, y) = if forwarding {
-                    let (dx, dy) = take_whole(&mut ctx.residual, delta);
+                    let (dx, dy) = screen::accumulate_delta(&mut ctx.residual, delta);
+                    // Disassociation only applies in the foreground. If the
+                    // cursor drifts, park it away from display edges. Avoid a
+                    // WindowServer warp for every physical mouse report.
+                    if (location.x - f64::from(ctx.anchor.0)).abs() >= 32.0
+                        || (location.y - f64::from(ctx.anchor.1)).abs() >= 32.0
+                    {
+                        ffi::warp(ctx.anchor);
+                    }
                     (ctx.anchor.0 + dx, ctx.anchor.1 + dy)
                 } else {
                     screen::pointer_sample(&ctx.layout, (location.x, location.y), delta)
                 };
                 let from = screen::pointer_location(&ctx.layout, (location.x, location.y));
-                Some(RawEvent::Move {
+                Ok(RawEvent::Move {
                     x,
                     y,
                     from: Some(from),
@@ -306,32 +349,26 @@ unsafe fn process(event_type: u32, event: CGEventRef) -> bool {
                 },
             };
             let down = matches!(event_type, LEFT_DOWN | RIGHT_DOWN | OTHER_DOWN);
-            handle(injected, |_, _| Some(RawEvent::Button { index, down }))
+            handle(|_, _| Ok(RawEvent::Button { index, down }))
         }
         KEY_DOWN | KEY_UP => {
             let kvk = ffi::CGEventGetIntegerValueField(event, KEYCODE) as u16;
             let keyboard_type = ffi::CGEventGetIntegerValueField(event, KEYBOARD_TYPE);
             let down = event_type == KEY_DOWN;
-            handle(injected, |ctx, _| {
-                Some(key_event(ctx, kvk, keyboard_type, down))
-            })
+            handle(|ctx, _| Ok(key_event(ctx, kvk, keyboard_type, down)))
         }
         FLAGS_CHANGED => {
             let kvk = ffi::CGEventGetIntegerValueField(event, KEYCODE) as u16;
             let keyboard_type = ffi::CGEventGetIntegerValueField(event, KEYBOARD_TYPE);
             if kvk == keymap::MAC_CAPS_LOCK {
-                let press = handle(injected, |ctx, _| {
-                    Some(key_event(ctx, kvk, keyboard_type, true))
-                });
-                let release = handle(injected, |ctx, _| {
-                    Some(key_event(ctx, kvk, keyboard_type, false))
-                });
+                let press = handle(|ctx, _| Ok(key_event(ctx, kvk, keyboard_type, true)));
+                let release = handle(|ctx, _| Ok(key_event(ctx, kvk, keyboard_type, false)));
                 return press || release;
             }
             let flags = ffi::CGEventGetFlags(event);
             match keymap::mac_modifier_down(kvk, flags) {
-                Some(down) => handle(injected, |ctx, _| {
-                    Some(match key_event(ctx, kvk, keyboard_type, down) {
+                Some(down) => handle(|ctx, _| {
+                    Ok(match key_event(ctx, kvk, keyboard_type, down) {
                         RawEvent::Key {
                             scan,
                             extended,
@@ -344,7 +381,7 @@ unsafe fn process(event_type: u32, event: CGEventRef) -> bool {
                         other => other,
                     })
                 }),
-                None => handle(injected, |_, _| None),
+                None => FORWARDING.load(Ordering::SeqCst),
             }
         }
         SCROLL_WHEEL => {
@@ -358,20 +395,11 @@ unsafe fn process(event_type: u32, event: CGEventRef) -> bool {
             );
             let continuous = ffi::CGEventGetIntegerValueField(event, SCROLL_CONTINUOUS) != 0;
             let (vertical, horizontal) = keymap::mac_scroll(lines, points, continuous);
-            let swallow = handle(injected, |_, _| {
-                Some(RawEvent::Wheel {
-                    delta: vertical,
-                    horizontal: false,
-                })
-            });
-            if horizontal != 0 {
-                let swallow_h = handle(injected, |_, _| {
-                    Some(RawEvent::Wheel {
-                        delta: horizontal,
-                        horizontal: true,
-                    })
-                });
-                return swallow || swallow_h;
+            let mut swallow = FORWARDING.load(Ordering::SeqCst);
+            for (delta, horizontal) in [(vertical, false), (horizontal, true)] {
+                if delta != 0 {
+                    swallow |= handle(|_, _| Ok(RawEvent::Wheel { delta, horizontal }));
+                }
             }
             swallow
         }
@@ -388,18 +416,22 @@ unsafe extern "C" fn tap_callback(
     if event_type == TAP_DISABLED_BY_TIMEOUT || event_type == TAP_DISABLED_BY_USER_INPUT {
         let tap = TAP.load(Ordering::SeqCst);
         if !tap.is_null() {
+            INSTALLED.store(false, Ordering::SeqCst);
             ffi::CGEventTapEnable(tap, true);
-            recovered(REASON_REMOVED);
+            if ffi::CGEventTapIsEnabled(tap) {
+                recovered(REASON_REMOVED);
+            } else {
+                lost();
+            }
         }
         return event;
     }
     if event.is_null() {
         return event;
     }
-    let swallow = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        process(event_type, event)
-    }))
-    .unwrap_or(false);
+    let swallow =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| process(event_type, event)))
+            .unwrap_or(false);
     if swallow {
         std::ptr::null_mut()
     } else {
@@ -432,6 +464,10 @@ unsafe fn install(run_loop: ffi::CFRunLoopRef) -> Option<Tap> {
         }
         ffi::CFRunLoopAddSource(run_loop, source, ffi::kCFRunLoopCommonModes);
         ffi::CGEventTapEnable(port, true);
+        if !ffi::CGEventTapIsEnabled(port) {
+            uninstall(run_loop, Tap { port, source });
+            continue;
+        }
         TAP.store(port, Ordering::SeqCst);
         return Some(Tap { port, source });
     }
@@ -446,23 +482,42 @@ unsafe fn uninstall(run_loop: ffi::CFRunLoopRef, tap: Tap) {
     ffi::CFRelease(tap.port as CFTypeRef);
 }
 fn recovered(reason: u8) {
-    INSTALLED.store(true, Ordering::SeqCst);
     REINSTALLS.fetch_add(1, Ordering::Relaxed);
     LAST_REINSTALL_MS.store(now_ms().max(1), Ordering::Relaxed);
     REASON.store(reason, Ordering::Relaxed);
-    send(Captured::HookReinstalled {
-        removed: reason == REASON_REMOVED,
-    });
+    if let Ok(mut guard) = CTX.lock() {
+        if let Some(ctx) = guard.as_mut() {
+            let removed = reason == REASON_REMOVED;
+            if removed {
+                release_pointer(ctx);
+            }
+            INSTALLED.store(true, Ordering::SeqCst);
+            let _ = ctx.tx.send(Captured::HookReinstalled {
+                removed,
+                session: ctx.logic.session,
+            });
+        }
+    }
 }
 fn lost() {
     INSTALLED.store(false, Ordering::SeqCst);
-    set_forwarding(false);
-    send(Captured::HookFailed);
+    if let Ok(mut guard) = CTX.lock() {
+        if let Some(ctx) = guard.as_mut() {
+            release_pointer(ctx);
+            let _ = ctx.tx.send(Captured::HookFailed {
+                session: ctx.logic.session,
+            });
+        }
+    }
 }
 fn refresh_layout() {
-    if let Some(layout) = screen::mac::layout() {
-        if let Ok(mut guard) = CTX.lock() {
-            if let Some(ctx) = guard.as_mut() {
+    let layout = screen::mac::layout();
+    if let Ok(mut guard) = CTX.lock() {
+        if let Some(ctx) = guard.as_mut() {
+            if !release_stale(ctx) && (ctx.cursor_detached || ctx.cursor_hidden) {
+                release_pointer(ctx);
+            }
+            if let Some(layout) = layout {
                 ctx.layout = layout;
             }
         }
@@ -520,6 +575,7 @@ fn spawn() -> Result<JoinHandle<()>, String> {
                 }
                 refresh_layout();
                 if REPAIR.swap(false, Ordering::SeqCst) {
+                    INSTALLED.store(false, Ordering::SeqCst);
                     if let Some(old) = tap.take() {
                         uninstall(run_loop, old);
                     }
@@ -531,10 +587,11 @@ fn spawn() -> Result<JoinHandle<()>, String> {
                     }
                 } else if let Some(current) = tap.as_ref() {
                     if !ffi::CGEventTapIsEnabled(current.port) {
+                        let was_installed = INSTALLED.swap(false, Ordering::SeqCst);
                         ffi::CGEventTapEnable(current.port, true);
                         if ffi::CGEventTapIsEnabled(current.port) {
                             recovered(REASON_REMOVED);
-                        } else if INSTALLED.load(Ordering::SeqCst) {
+                        } else if was_installed {
                             lost();
                         }
                     }
@@ -543,6 +600,13 @@ fn spawn() -> Result<JoinHandle<()>, String> {
             set_forwarding(false);
             if let Some(tap) = tap.take() {
                 uninstall(run_loop, tap);
+            }
+            // The worker owns the retained run loop, including a setup that
+            // finishes after its caller has already timed out.
+            let mut stored = RUN_LOOP.lock().unwrap_or_else(|p| p.into_inner());
+            if *stored != 0 {
+                ffi::CFRelease(*stored as CFTypeRef);
+                *stored = 0;
             }
             INSTALLED.store(false, Ordering::SeqCst);
             RUNNING.store(false, Ordering::SeqCst);
@@ -557,9 +621,9 @@ fn spawn() -> Result<JoinHandle<()>, String> {
         Err(error) => {
             STOP.store(true, Ordering::SeqCst);
             wake();
-            if handle.is_finished() {
-                let _ = handle.join();
-            }
+            // Retain ownership even if installation is delayed in
+            // WindowServer. A retry must join this tap before reusing CTX.
+            *THREAD.lock().unwrap_or_else(|p| p.into_inner()) = Some(handle);
             Err(error)
         }
     }
@@ -570,12 +634,6 @@ fn stop_thread() {
         STOP.store(true, Ordering::SeqCst);
         wake();
         let _ = handle.join();
-    }
-    if let Ok(mut run_loop) = RUN_LOOP.lock() {
-        if *run_loop != 0 {
-            unsafe { ffi::CFRelease(*run_loop as CFTypeRef) };
-            *run_loop = 0;
-        }
     }
 }
 
@@ -596,6 +654,9 @@ impl HookThread {
             anchor: (0, 0),
             residual: (0.0, 0.0),
             keyboard: None,
+            cursor_hidden: false,
+            cursor_detached: false,
+            motion_since: 0,
         });
         set_forwarding(false);
         take_moves();
@@ -604,9 +665,7 @@ impl HookThread {
         REASON.store(0, Ordering::Relaxed);
         match spawn() {
             Ok(handle) => {
-                if let Ok(mut thread) = THREAD.lock() {
-                    *thread = Some(handle);
-                }
+                *THREAD.lock().unwrap_or_else(|p| p.into_inner()) = Some(handle);
                 Ok(Self)
             }
             Err(error) => {
@@ -623,21 +682,5 @@ impl HookThread {
         if let Ok(mut ctx) = CTX.lock() {
             *ctx = None;
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::take_whole;
-
-    #[test]
-    fn fractional_deltas_accumulate() {
-        let mut residual = (0.0, 0.0);
-        assert_eq!(take_whole(&mut residual, (0.4, -0.6)), (0, 0));
-        assert_eq!(take_whole(&mut residual, (0.4, -0.6)), (0, -1));
-        assert_eq!(take_whole(&mut residual, (0.4, 2.0)), (1, 1));
-        assert!((residual.0 - 0.2).abs() < 1e-9 && (residual.1 - 0.8).abs() < 1e-9);
-        assert_eq!(take_whole(&mut residual, (f64::NAN, 0.0)), (0, 0));
-        assert_eq!(take_whole(&mut residual, (1e9, 0.0)).0, super::super::MAX_DELTA);
     }
 }

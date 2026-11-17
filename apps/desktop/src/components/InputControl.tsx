@@ -43,11 +43,12 @@ export function InputControl({ peer, enabled, onPermissionsChanged }: { peer: Co
     const request = ++generation.current;
     setStarting(true);
     try {
-      await allowLocally(peer.id, ["input"]);
-      await onPermissionsChanged();
       setWaiting(true);
       let answer: "granted" | "outdated";
       try { answer = await askPeerForInput(peer.id, false); } finally { if (mounted.current) setWaiting(false); }
+      if (!mounted.current || generation.current !== request) return;
+      await allowLocally(peer.id, ["input"]);
+      await onPermissionsChanged();
       if (!mounted.current || generation.current !== request) return;
       if (answer === "outdated") toast.info(`${peer.name} runs an older TrapLink. If control is refused, allow mouse and keyboard there.`);
       await nativeCommand("set_peer_control", { id: peer.id, enabled: true });
@@ -57,7 +58,7 @@ export function InputControl({ peer, enabled, onPermissionsChanged }: { peer: Co
       }
       activeRef.current = true;
       setActive(true);
-    } catch (error) { toast.error(messageFrom(error)); }
+    } catch (error) { if (mounted.current && generation.current === request) toast.error(messageFrom(error)); }
     finally { if (mounted.current) setStarting(false); }
   }
 

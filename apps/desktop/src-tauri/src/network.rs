@@ -148,10 +148,60 @@ impl Session {
             protocol: crate::link::PROTOCOL,
         }
     }
+    fn stop_untagged(&self) {
+        self.notify_stop(Wire::ControlStop, true);
+    }
+    pub(crate) fn notify_input_stop(&self, active: bool) {
+        let message = if self.protocol >= crate::link::SCOPED_FLOW {
+            Wire::EmergencyStop
+        } else {
+            Wire::ControlStop
+        };
+        self.notify_stop(message, active);
+    }
+    fn notify_stop(&self, message: Wire, active: bool) {
+        if self
+            .tx
+            .try_send(Outgoing {
+                message,
+                result: None,
+            })
+            .is_err()
+            && active
+        {
+            let _ = self.cancel.send(true);
+        }
+    }
 }
 pub struct Outgoing {
     pub message: Wire,
     pub result: Option<oneshot::Sender<Result<(), String>>>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum FlowPacket {
+    Input { event: InputEvent },
+    Keepalive,
+    Return { entry: f64 },
+    Stop,
+}
+
+impl FlowPacket {
+    fn into_wire(self, session: Option<Uuid>) -> Wire {
+        if let Some(session) = session {
+            return Wire::Flow {
+                session,
+                packet: self,
+            };
+        }
+        match self {
+            Self::Input { event } => Wire::Input { event },
+            Self::Keepalive => Wire::InputKeepalive,
+            Self::Return { entry } => Wire::FlowReturn { entry },
+            Self::Stop => Wire::ControlStop,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -192,18 +242,25 @@ pub enum Wire {
         request: String,
     },
     ControlStop,
+    EmergencyStop,
     Input {
         event: InputEvent,
     },
     InputKeepalive,
     FlowStart {
         request: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session: Option<Uuid>,
         edge: FlowEdge,
         entry: f64,
         clipboard: bool,
     },
     FlowReturn {
         entry: f64,
+    },
+    Flow {
+        session: Uuid,
+        packet: FlowPacket,
     },
     Ping,
     Probe {
@@ -818,19 +875,18 @@ fn install_session(
         protocol,
         ..Session::new(tx, cancel, generation)
     });
-    let (rtt, farewell) = (session.rtt_ms.clone(), session.farewell.clone());
     if let Some(old) = core
         .sessions
         .lock()
         .map_err(|_| "Network lock unavailable.")?
-        .insert(peer.id.clone(), session)
+        .insert(peer.id.clone(), session.clone())
     {
         crate::input::stop_peer(&core, &peer.id);
         let _ = old.cancel.send(true);
     }
     drop(data);
     tokio::spawn(run_session(
-        core, stream, noise, peer, rx, cancel_rx, generation, protocol, rtt, farewell,
+        core, stream, noise, peer, rx, cancel_rx, session,
     ));
     Ok(())
 }
@@ -973,48 +1029,39 @@ async fn incoming(
             error: crate::input::start_receiving(core, &peer.id).err(),
         }),
         Wire::ControlStop => {
+            // Modern Flow stops carry a visit ID. An untagged stop on that
+            // connection belongs to focused control. Older peers share it.
+            if session(core, &peer.id).is_ok_and(|link| link.protocol >= crate::link::SCOPED_FLOW) {
+                crate::input::stop_focused(core, &peer.id);
+            } else {
+                crate::input::stop_peer(core, &peer.id);
+            }
+            None
+        }
+        Wire::EmergencyStop => {
             crate::input::stop_peer(core, &peer.id);
             None
         }
-        Wire::Input { event } => match crate::input::receive(core, &peer.id, event) {
-            Err(error) => {
-                crate::input::stop_peer(core, &peer.id);
-                core.warning(error);
-                Some(Wire::ControlStop)
-            }
-            Ok(Some(info)) => {
-                if info.clipboard && clipboard_permitted(core, &peer.id) {
-                    let (core, id) = (core.clone(), peer.id.clone());
-                    tokio::spawn(async move {
-                        let _ = send_clipboard(core, &id).await;
-                    });
-                }
-                Some(Wire::FlowReturn { entry: info.entry })
-            }
-            Ok(None) => None,
-        },
+        Wire::Input { event } => incoming_input(core, peer, None, FlowPacket::Input { event }),
+        Wire::Flow { session, packet } => incoming_input(core, peer, Some(session), packet),
         Wire::FlowStart {
             request,
+            session,
             edge,
             entry,
             clipboard,
         } => Some(Wire::Ack {
             request,
-            error: crate::input::start_flow_receiving(core, &peer.id, edge, entry, clipboard).err(),
+            error: crate::input::start_flow_receiving(
+                core, &peer.id, session, edge, entry, clipboard,
+            )
+            .err(),
         }),
         Wire::FlowReturn { entry } => {
-            if let Err(error) = crate::flow::returned(core, &peer.id, entry) {
-                core.warning(error);
-            }
-            None
+            incoming_input(core, peer, None, FlowPacket::Return { entry })
         }
         Wire::InputConsent { request, flow } => consent_requested(core, peer, request, flow),
-        Wire::InputKeepalive => {
-            if crate::input::keepalive(core, &peer.id).is_err() {
-                return Some(Wire::ControlStop);
-            }
-            None
-        }
+        Wire::InputKeepalive => incoming_input(core, peer, None, FlowPacket::Keepalive),
         Wire::Clipboard { request, text } => {
             let result = permit(core, &peer.id, false).and_then(|_| {
                 if text.len() <= MAX_CLIPBOARD {
@@ -1158,6 +1205,53 @@ async fn incoming(
     }
 }
 
+fn incoming_input(
+    core: &Arc<Core>,
+    peer: &Peer,
+    session: Option<Uuid>,
+    packet: FlowPacket,
+) -> Option<Wire> {
+    let result = match packet {
+        FlowPacket::Stop => {
+            if let Some(token) = session {
+                if let Ok(mut state) = core.input.lock() {
+                    state.acknowledge_stop(&peer.id, token);
+                }
+            }
+            return None;
+        }
+        FlowPacket::Return { entry } => {
+            match crate::flow::returned(core, &peer.id, session, entry) {
+                Ok(true) => return Some(FlowPacket::Stop.into_wire(session)),
+                Ok(false) => {}
+                Err(error) => core.warning(error),
+            }
+            return None;
+        }
+        FlowPacket::Input { event } => crate::input::receive(core, &peer.id, session, event),
+        FlowPacket::Keepalive => crate::input::keepalive(core, &peer.id, session).map(|_| None),
+    };
+    match result {
+        Ok(Some(info)) => {
+            if info.clipboard && clipboard_permitted(core, &peer.id) {
+                let (core, id) = (core.clone(), peer.id.clone());
+                tokio::spawn(async move {
+                    let _ = send_clipboard(core, &id).await;
+                });
+            }
+            Some(FlowPacket::Return { entry: info.entry }.into_wire(session))
+        }
+        Ok(None) => None,
+        Err(error) => {
+            crate::input::stop_receiving(core, &peer.id, session);
+            if error != crate::input::INACTIVE {
+                core.warning(error);
+            }
+            Some(FlowPacket::Stop.into_wire(session))
+        }
+    }
+}
+
 fn consent_requested(core: &Core, peer: &Peer, request: String, flow: bool) -> Option<Wire> {
     let permitted = crate::input::enabled(core, &peer.id).is_ok();
     let name = core
@@ -1212,11 +1306,12 @@ async fn run_session(
     peer: Peer,
     mut outgoing: mpsc::Receiver<Outgoing>,
     mut cancel: watch::Receiver<bool>,
-    generation: Uuid,
-    protocol: u32,
-    rtt: Arc<AtomicU32>,
-    farewell: Arc<AtomicBool>,
+    session: Arc<Session>,
 ) {
+    let (generation, protocol) = (session.generation, session.protocol);
+    let (rtt, farewell) = (session.rtt_ms.clone(), session.farewell.clone());
+    // Let closing the last owning session also close its outgoing channel.
+    drop(session);
     let probing = protocol >= crate::link::PROBING;
     let (mut reader, mut writer) = stream.into_split();
     let (frames_tx, mut frames) = mpsc::channel(8);
@@ -1247,7 +1342,6 @@ async fn run_session(
         }
         pending.retain(|_, result| !result.is_closed());
         tokio::select! {
-            biased;
             _ = cancel.changed() => break,
             _ = transfer_cleanup.tick() => expire_incoming(&core, &mut files, Instant::now()),
             _ = heartbeat.tick() => {
@@ -1302,7 +1396,7 @@ async fn run_session(
         .await;
     }
     reader_task.abort();
-    for (id, _) in &files {
+    for id in files.keys() {
         core.transfer_status(id, "failed");
     }
     for (_, result) in pending {
@@ -1321,7 +1415,7 @@ async fn run_session(
         }
     }
 }
-fn session(core: &Core, id: &str) -> Result<Arc<Session>, String> {
+pub(super) fn session(core: &Core, id: &str) -> Result<Arc<Session>, String> {
     core.sessions
         .lock()
         .map_err(|_| "Network lock unavailable.")?
@@ -1374,35 +1468,61 @@ pub async fn send_clipboard(core: Arc<Core>, id: &str) -> Result<(), String> {
 pub async fn set_control(core: Arc<Core>, id: &str, enabled: bool) -> Result<(), String> {
     let session = session(&core, id)?;
     if !enabled {
-        crate::input::stop_peer(&core, id);
-        return tokio::time::timeout(
-            Duration::from_secs(3),
-            session.tx.send(Outgoing {
-                message: Wire::ControlStop,
-                result: None,
-            }),
-        )
-        .await
-        .map_err(|_| "Peer did not receive the stop request.".to_string())?
-        .map_err(|_| "Peer disconnected.".into());
+        let mut state = core.input.lock().map_err(|_| "Input lock unavailable.")?;
+        if state.sending_to.as_deref() == Some(id) && state.flow.switch.peer().is_none() {
+            state.sending_to = None;
+            state.pending_control = None;
+            // Stop locally even if the peer no longer drains its queue. In
+            // that case socket teardown releases the peer's receiver lease.
+            session.stop_untagged();
+        }
+        return Ok(());
     }
     crate::input::enabled(&core, id)?;
+    let token = Uuid::new_v4();
+    let (answer, response) = oneshot::channel();
     {
-        let mut state = core.input.lock().map_err(|_| "Input lock unavailable.")?;
+        // A legacy peer treats every stop as untagged. Queue its new focused
+        // start only after the previous Flow transition has sent its last stop.
+        let _transition = if session.protocol < crate::link::SCOPED_FLOW {
+            Some(crate::flow::transition(&core).await?)
+        } else {
+            None
+        };
+        let slot = tokio::time::timeout(Duration::from_secs(3), session.tx.reserve())
+            .await
+            .map_err(|_| "Peer is not responding.")?
+            .map_err(|_| "Peer disconnected.")?;
+        let mut state = crate::input::reserve_input(&core, id)?;
         if state.busy() {
             return Err("Stop the existing input session first.".into());
         }
         state.sending_to = Some(id.into());
+        state.pending_control = Some(token);
+        slot.send(Outgoing {
+            message: Wire::ControlStart {
+                request: token.to_string(),
+            },
+            result: Some(answer),
+        });
     }
-    let result = request(
-        &session,
-        Wire::ControlStart {
-            request: Uuid::new_v4().to_string(),
-        },
-    )
-    .await;
+    let result = tokio::time::timeout(Duration::from_secs(30), response).await;
+    let mut state = core.input.lock().map_err(|_| "Input lock unavailable.")?;
+    if state.pending_control != Some(token) {
+        return Err("Focused control ended before the peer confirmed.".into());
+    }
+    state.pending_control = None;
+    // A timed-out request may already have started a receiver. Queue the
+    // matching stop before making room for another local session.
     if result.is_err() {
-        crate::input::stop_peer(&core, id);
+        session.stop_untagged();
+    }
+    let result = result
+        .map_err(|_| "Peer did not acknowledge the request.".to_string())
+        .and_then(|answer| answer.map_err(|_| "Peer disconnected.".to_string()))
+        .and_then(|answer| answer);
+    if result.is_err() {
+        state.sending_to = None;
     }
     result
 }
@@ -1436,19 +1556,31 @@ pub async fn request_input_consent(core: Arc<Core>, id: &str, flow: bool) -> Res
     }
     result
 }
-pub async fn flow_start(
+#[cfg(all(test, windows))]
+async fn flow_start(
     core: &Core,
     id: &str,
+    token: Uuid,
+    edge: FlowEdge,
+    entry: f64,
+    clipboard: bool,
+) -> Result<(), String> {
+    let session = session(core, id)?;
+    flow_start_on(&session, token, edge, entry, clipboard).await
+}
+pub(super) async fn flow_start_on(
+    session: &Session,
+    token: Uuid,
     edge: FlowEdge,
     entry: f64,
     clipboard: bool,
 ) -> Result<(), String> {
     crate::flow::validate_entry(entry)?;
-    let session = session(core, id)?;
     request(
-        &session,
+        session,
         Wire::FlowStart {
-            request: Uuid::new_v4().to_string(),
+            request: token.to_string(),
+            session: (session.protocol >= crate::link::SCOPED_FLOW).then_some(token),
             edge,
             entry,
             clipboard,
@@ -1456,18 +1588,76 @@ pub async fn flow_start(
     )
     .await
 }
-pub async fn send_message(core: &Core, id: &str, message: Wire) -> Result<(), String> {
-    let session = session(core, id)?;
-    tokio::time::timeout(
-        Duration::from_secs(2),
-        session.tx.send(Outgoing {
-            message,
+#[cfg(all(test, windows))]
+async fn send_flow(core: &Core, id: &str, token: Uuid, packet: FlowPacket) -> Result<(), String> {
+    let link = session(core, id)?;
+    send_flow_on(core, id, &link, token, packet).await
+}
+pub(super) async fn send_flow_on(
+    core: &Core,
+    id: &str,
+    session: &Session,
+    token: Uuid,
+    packet: FlowPacket,
+) -> Result<(), String> {
+    let scoped = (session.protocol >= crate::link::SCOPED_FLOW).then_some(token);
+    let slot = tokio::time::timeout(Duration::from_secs(2), session.tx.reserve())
+        .await
+        .map_err(|_| "Peer stopped receiving input.".to_string())?
+        .map_err(|_| "Peer disconnected.")?;
+    if scoped.is_none() && matches!(packet, FlowPacket::Input { .. } | FlowPacket::Keepalive) {
+        // A legacy receiver cannot reject late input. Check our lease after
+        // any wait for channel capacity and enqueue while it is still active.
+        let state = core.input.lock().map_err(|_| "Input lock unavailable.")?;
+        if state.flow.forwarding() == Some(id) && state.flow.switch_id() == Some(token) {
+            slot.send(Outgoing {
+                message: packet.into_wire(None),
+                result: None,
+            });
+        }
+    } else {
+        slot.send(Outgoing {
+            message: packet.into_wire(scoped),
             result: None,
-        }),
-    )
-    .await
-    .map_err(|_| "Peer stopped receiving input.".to_string())?
-    .map_err(|_| "Peer disconnected.".into())
+        });
+    }
+    Ok(())
+}
+pub async fn release_flow_control(core: &Core, peer: &str, token: Uuid) -> Result<(), String> {
+    let link = session(core, peer);
+    let pending = {
+        let mut state = core.input.lock().map_err(|_| "Input lock unavailable.")?;
+        if !state.stop_flow(peer, token) {
+            return Err("Control has already moved. Check the current computer.".into());
+        }
+        let Ok(link) = link else {
+            return Ok(());
+        };
+        if link.protocol < crate::link::SCOPED_FLOW {
+            // Enqueue the untagged stop before a new legacy start. If the
+            // queue is full, closing this connection releases its receiver.
+            link.stop_untagged();
+            return Ok(());
+        }
+        let stop = Outgoing {
+            message: FlowPacket::Stop.into_wire(Some(token)),
+            result: None,
+        };
+        match link.tx.try_send(stop) {
+            Err(mpsc::error::TrySendError::Full(stop)) => (link, stop),
+            _ => return Ok(()),
+        }
+    };
+    // Local capture has already been released. A full queue may delay only
+    // the notification for this visit, never the user's physical pointer.
+    let (link, stop) = pending;
+    if tokio::time::timeout(Duration::from_secs(2), link.tx.send(stop))
+        .await
+        .is_err()
+    {
+        let _ = link.cancel.send(true);
+    }
+    Ok(())
 }
 pub fn try_send(core: &Core, id: &str, message: Wire) {
     if let Ok(session) = session(core, id) {
@@ -1489,15 +1679,14 @@ pub async fn send_input(
     event: Option<InputEvent>,
 ) -> Result<(), String> {
     crate::input::enabled(&core, id)?;
-    if core
-        .input
-        .lock()
-        .map_err(|_| "Input lock unavailable.")?
-        .sending_to
-        .as_deref()
-        != Some(id)
     {
-        return Err("Start focused control first.".into());
+        let state = core.input.lock().map_err(|_| "Input lock unavailable.")?;
+        if state.sending_to.as_deref() != Some(id)
+            || state.pending_control.is_some()
+            || state.flow.switch.peer().is_some()
+        {
+            return Err("Start focused control first.".into());
+        }
     }
     if let Some(event) = &event {
         crate::input::validate(event)?;
@@ -1579,19 +1768,26 @@ pub async fn send_file(core: Arc<Core>, id: &str, path: &Path) -> Result<Transfe
             if total > meta.len() {
                 return Err("File changed while sending.".into());
             }
-            tokio::time::timeout(
-                Duration::from_secs(5),
-                session.tx.send(Outgoing {
-                    message: Wire::FileChunk {
-                        request: transfer.id.clone(),
-                        data: STANDARD.encode(&buffer[..count]),
-                    },
-                    result: None,
-                }),
-            )
+            // Allow the reader to prepare the next chunk as the writer sends
+            // this one. Filling the shared queue with bulk data makes cursor
+            // updates and handoffs wait behind up to a megabyte per transfer.
+            let (dequeued, ready) = oneshot::channel();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                session
+                    .tx
+                    .send(Outgoing {
+                        message: Wire::FileChunk {
+                            request: transfer.id.clone(),
+                            data: STANDARD.encode(&buffer[..count]),
+                        },
+                        result: Some(dequeued),
+                    })
+                    .await
+                    .map_err(|_| "Peer disconnected.".to_string())?;
+                ready.await.map_err(|_| "Peer disconnected.".to_string())?
+            })
             .await
-            .map_err(|_| "Peer stopped receiving the file.".to_string())?
-            .map_err(|_| "Peer disconnected.".to_string())?;
+            .map_err(|_| "Peer stopped receiving the file.".to_string())??;
         }
         if total != meta.len() {
             return Err("File changed while sending.".into());
@@ -1737,6 +1933,41 @@ mod tests {
         (directory, core, peer)
     }
     #[test]
+    fn emergency_release_disconnects_only_the_active_peer_if_queues_are_full() {
+        let (_directory, core, peer) = receiving_fixture();
+        let mut receivers = Vec::new();
+        for (id, busy) in [
+            (&peer.id[..], true),
+            ("busy-file-peer", true),
+            ("idle-peer", false),
+        ] {
+            let (tx, messages) = mpsc::channel(1);
+            let (cancel, cancelled) = watch::channel(false);
+            let link = Arc::new(Session::new(tx, cancel, Uuid::new_v4()));
+            if busy {
+                link.tx
+                    .try_send(Outgoing {
+                        message: Wire::Ping,
+                        result: None,
+                    })
+                    .unwrap();
+            }
+            core.sessions.lock().unwrap().insert(id.to_owned(), link);
+            receivers.push((messages, cancelled));
+        }
+        core.data.lock().unwrap().settings.input_enabled = true;
+        core.input.lock().unwrap().sending_to = Some(peer.id);
+        crate::stop_all_input(&core, true);
+        assert!(!core.data.lock().unwrap().settings.input_enabled);
+        assert!(core.input.lock().unwrap().sending_to.is_none());
+        assert!(*receivers[0].1.borrow());
+        assert!(!*receivers[1].1.borrow());
+        assert!(matches!(
+            receivers[2].0.try_recv().unwrap().message,
+            Wire::EmergencyStop
+        ));
+    }
+    #[test]
     fn disconnected_or_replaced_sessions_cannot_process_queued_messages() {
         let (_directory, core, peer) = receiving_fixture();
         let (tx, _) = mpsc::channel(1);
@@ -1751,6 +1982,209 @@ mod tests {
         assert!(is_current_session(&core, &peer.id, current));
         disconnect(&core, &peer.id).unwrap();
         assert!(!is_current_session(&core, &peer.id, current));
+    }
+
+    #[tokio::test]
+    async fn flow_starts_use_the_peer_protocol_and_keep_the_legacy_wire_shape() {
+        for protocol in [crate::consent::PROTOCOL, crate::link::SCOPED_FLOW] {
+            let (tx, mut rx) = mpsc::channel(1);
+            let (cancel, _) = watch::channel(false);
+            let link = Session {
+                protocol,
+                ..Session::new(tx, cancel, Uuid::new_v4())
+            };
+            let token = Uuid::new_v4();
+            let start = flow_start_on(&link, token, FlowEdge::Right, 0.5, false);
+            let ack = async {
+                let outgoing = rx.recv().await.unwrap();
+                let json = serde_json::to_value(&outgoing.message).unwrap();
+                assert_eq!(json["kind"], "flow_start");
+                assert_eq!(json["request"], token.to_string());
+                if protocol == crate::link::SCOPED_FLOW {
+                    assert_eq!(json["session"], token.to_string());
+                } else {
+                    assert!(json.get("session").is_none());
+                    let decoded: Wire = serde_json::from_value(json).unwrap();
+                    assert!(matches!(decoded, Wire::FlowStart { session: None, .. }));
+                }
+                outgoing.result.unwrap().send(Ok(())).unwrap();
+            };
+            tokio::join!(start, ack).0.unwrap();
+        }
+        assert!(matches!(
+            FlowPacket::Stop.into_wire(None),
+            Wire::ControlStop
+        ));
+        assert!(matches!(
+            FlowPacket::Keepalive.into_wire(None),
+            Wire::InputKeepalive
+        ));
+        assert!(matches!(
+            FlowPacket::Return { entry: 0.5 }.into_wire(None),
+            Wire::FlowReturn { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_legacy_focused_start_waits_for_the_previous_flow_stop() {
+        let (_directory, core, peer) = receiving_fixture();
+        {
+            let mut data = core.data.lock().unwrap();
+            data.settings.input_enabled = true;
+            data.peers[0].peer.permissions.input = true;
+        }
+        let (tx, mut rx) = mpsc::channel(2);
+        let (cancel, _) = watch::channel(false);
+        let link = Arc::new(Session {
+            protocol: crate::consent::PROTOCOL,
+            ..Session::new(tx, cancel, Uuid::new_v4())
+        });
+        core.sessions
+            .lock()
+            .unwrap()
+            .insert(peer.id.clone(), link.clone());
+
+        // A canceled Flow start still owns its transition until a delayed
+        // acknowledgement has been answered with the final untagged stop.
+        let previous = crate::flow::transition(&core).await.unwrap();
+        let focused = set_control(core.clone(), &peer.id, true);
+        tokio::pin!(focused);
+        tokio::select! {
+            biased;
+            result = &mut focused => panic!("focused start completed early: {result:?}"),
+            _ = std::future::ready(()) => {}
+        }
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        send_flow_on(&core, &peer.id, &link, Uuid::new_v4(), FlowPacket::Stop)
+            .await
+            .unwrap();
+        drop(previous);
+
+        let acknowledge = async {
+            assert!(matches!(
+                rx.recv().await.unwrap().message,
+                Wire::ControlStop
+            ));
+            let start = rx.recv().await.unwrap();
+            assert!(matches!(start.message, Wire::ControlStart { .. }));
+            start.result.unwrap().send(Ok(())).unwrap();
+        };
+        tokio::join!(focused, acknowledge).0.unwrap();
+        assert!(crate::input::active_with(&core, &peer.id));
+    }
+
+    #[tokio::test]
+    async fn returning_control_releases_local_capture_before_a_full_queue_drains() {
+        let (_directory, core, peer) = receiving_fixture();
+        let (tx, mut rx) = mpsc::channel(1);
+        let (cancel, _) = watch::channel(false);
+        let link = Arc::new(Session::new(tx, cancel, Uuid::new_v4()));
+        core.sessions
+            .lock()
+            .unwrap()
+            .insert(peer.id.clone(), link.clone());
+        link.tx
+            .try_send(Outgoing {
+                message: Wire::Ping,
+                result: None,
+            })
+            .unwrap();
+        let start = || {
+            let mut input = core.input.lock().unwrap();
+            input.sending_to = Some(peer.id.clone());
+            let token = input
+                .flow
+                .begin_switch(&peer.id, FlowEdge::Left, Instant::now(), link.clone())
+                .unwrap();
+            assert!(input.flow.switch.apply(crate::flow::SwitchEvent::Started {
+                peer: peer.id.clone(),
+                ok: true
+            }));
+            token
+        };
+        let first = start();
+        let release = tokio::spawn({
+            let (core, id) = (core.clone(), peer.id.clone());
+            async move { release_flow_control(&core, &id, first).await }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while crate::input::active_with(&core, &peer.id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the occupied slot must not prevent a local release");
+        let second = start();
+        assert!(matches!(rx.recv().await.unwrap().message, Wire::Ping));
+        release.await.unwrap().unwrap();
+        assert!(
+            matches!(rx.recv().await.unwrap().message, Wire::Flow { session, packet: FlowPacket::Stop } if session == first)
+        );
+        assert_eq!(core.input.lock().unwrap().flow.switch_id(), Some(second));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_returned_receiver_can_accept_a_new_visit_before_the_old_stop() {
+        let (_dir, core, peer) = receiving_fixture();
+        {
+            let mut data = core.data.lock().unwrap();
+            data.settings.input_enabled = true;
+            data.peers[0].peer.permissions.input = true;
+        }
+        let mut files = HashMap::new();
+        let start = |token: Uuid| Wire::FlowStart {
+            request: token.to_string(),
+            session: Some(token),
+            edge: FlowEdge::Left,
+            entry: 1.0,
+            clipboard: false,
+        };
+        let (first, second) = (Uuid::new_v4(), Uuid::new_v4());
+        assert!(matches!(
+            incoming(&core, &peer, start(first), &mut files).await,
+            Some(Wire::Ack { error: None, .. })
+        ));
+        assert!(matches!(
+            incoming(&core, &peer, start(second), &mut files).await,
+            Some(Wire::Ack { error: Some(_), .. })
+        ));
+        let movement = FlowPacket::Input {
+            event: InputEvent::MoveBy { dx: 100, dy: 0 },
+        };
+        assert!(
+            matches!(incoming_input(&core, &peer, Some(first), movement),
+            Some(Wire::Flow { session, packet: FlowPacket::Return { .. } }) if session == first)
+        );
+        assert!(matches!(
+            incoming(&core, &peer, start(second), &mut files).await,
+            Some(Wire::Ack { error: None, .. })
+        ));
+        incoming_input(&core, &peer, Some(first), FlowPacket::Stop);
+        assert!(incoming_input(&core, &peer, Some(second), FlowPacket::Keepalive).is_none());
+        assert!(core.input.lock().unwrap().last_return.is_none());
+        let movement = FlowPacket::Input {
+            event: InputEvent::MoveBy { dx: 100, dy: 0 },
+        };
+        assert!(
+            matches!(incoming_input(&core, &peer, Some(second), movement),
+            Some(Wire::Flow { session, packet: FlowPacket::Return { .. } }) if session == second)
+        );
+        incoming_input(&core, &peer, Some(second), FlowPacket::Stop);
+        assert!(!crate::input::active_with(&core, &peer.id));
+        assert_eq!(
+            core.input
+                .lock()
+                .unwrap()
+                .last_return
+                .as_ref()
+                .unwrap()
+                .peer,
+            peer.id
+        );
     }
     #[tokio::test]
     async fn abort_revocation_and_timeout_remove_partial_transfers() {
@@ -1877,15 +2311,17 @@ mod tests {
     }
     #[test]
     fn consent_message_round_trips_and_defaults_flow() {
-        let wire: Wire =
-            serde_json::from_str(r#"{"kind":"input_consent","request":"r"}"#).unwrap();
+        let wire: Wire = serde_json::from_str(r#"{"kind":"input_consent","request":"r"}"#).unwrap();
         assert!(matches!(wire, Wire::InputConsent { ref request, flow: false } if request == "r"));
         let text = serde_json::to_string(&Wire::InputConsent {
             request: "r".into(),
             flow: true,
         })
         .unwrap();
-        assert_eq!(text, r#"{"kind":"input_consent","request":"r","flow":true}"#);
+        assert_eq!(
+            text,
+            r#"{"kind":"input_consent","request":"r","flow":true}"#
+        );
     }
     #[tokio::test]
     async fn consent_is_never_sent_to_older_peers() {
@@ -1902,23 +2338,29 @@ mod tests {
             .insert(peer.id.clone(), Arc::new(session));
         let result = request_input_consent(core.clone(), &peer.id, true).await;
         assert_eq!(result, Err(crate::consent::OUTDATED.to_string()));
-        assert!(rx.try_recv().is_err(), "nothing was queued for the old peer");
+        assert!(
+            rx.try_recv().is_err(),
+            "nothing was queued for the old peer"
+        );
     }
     #[tokio::test]
     async fn requester_waits_for_the_answer_and_allows_one_request_per_peer() {
         let (_directory, core, peer) = receiving_fixture();
         let (tx, mut rx) = mpsc::channel(4);
         let (cancel, _) = watch::channel(false);
-        core.sessions
-            .lock()
-            .unwrap()
-            .insert(peer.id.clone(), Arc::new(Session::new(tx, cancel, Uuid::new_v4())));
+        core.sessions.lock().unwrap().insert(
+            peer.id.clone(),
+            Arc::new(Session::new(tx, cancel, Uuid::new_v4())),
+        );
         let waiting = tokio::spawn({
             let (core, id) = (core.clone(), peer.id.clone());
             async move { request_input_consent(core, &id, false).await }
         });
         let sent = rx.recv().await.unwrap();
-        assert!(matches!(sent.message, Wire::InputConsent { flow: false, .. }));
+        assert!(matches!(
+            sent.message,
+            Wire::InputConsent { flow: false, .. }
+        ));
         assert_eq!(
             request_input_consent(core.clone(), &peer.id, false).await,
             Err(crate::consent::BUSY.to_string())
@@ -1931,7 +2373,12 @@ mod tests {
             waiting.await.unwrap(),
             Err(crate::consent::DECLINED.to_string())
         );
-        assert!(core.consent.lock().unwrap().begin_outgoing(&peer.id, Instant::now()).is_ok());
+        assert!(core
+            .consent
+            .lock()
+            .unwrap()
+            .begin_outgoing(&peer.id, Instant::now())
+            .is_ok());
     }
     #[test]
     fn path_and_address_boundary() {
@@ -2155,3 +2602,7 @@ mod tests {
         assert!(!core.invite.lock().unwrap().as_ref().unwrap().reserved);
     }
 }
+
+#[cfg(all(test, windows))]
+#[path = "network/handoff_tests.rs"]
+mod handoff_tests;

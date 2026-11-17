@@ -9,27 +9,83 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
+use uuid::Uuid;
+
+#[cfg(all(windows, not(test)))]
+use crate::screen::win as windows_pointer;
+#[cfg(all(windows, test))]
+#[path = "input/test_display.rs"]
+mod windows_pointer;
+
+const SESSION_TIMEOUT: Duration = Duration::from_secs(3);
+pub const INACTIVE: &str = "Input control is not active.";
 
 #[derive(Default)]
 pub struct InputState {
     pub sending_to: Option<String>,
+    pub pending_control: Option<Uuid>,
     receiving: Option<Receiver>,
+    // Enigo's macOS destructor waits for posted native events. Reuse one idle
+    // injector so that drain never stalls a handoff or the encrypted LAN reader.
+    #[cfg(target_os = "macos")]
+    idle_injector: Option<enigo::Enigo>,
     pub flow: FlowState,
+    pub last_return: Option<crate::flow::FlowTiming>,
 }
 impl InputState {
     pub fn busy(&self) -> bool {
         self.sending_to.is_some() || self.receiving.is_some()
     }
+    fn finish_receiving(&mut self) {
+        if let Some(mut receiver) = self.receiving.take() {
+            receiver.release_all();
+            #[cfg(target_os = "macos")]
+            if receiver.codes.is_empty() && receiver.buttons.is_empty() {
+                self.idle_injector = Some(receiver.enigo);
+            }
+        }
+    }
+}
+impl Drop for InputState {
+    fn drop(&mut self) {
+        self.finish_receiving();
+    }
 }
 
 struct ReceiverFlow {
+    session: Option<Uuid>,
     watch: ReturnWatch,
     clipboard: bool,
-    returned: bool,
+    returned_at: Option<Instant>,
 }
 pub struct FlowReturnInfo {
     pub entry: f64,
     pub clipboard: bool,
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Default)]
+struct ClickSeries {
+    last_down: Option<(Instant, (i32, i32))>,
+    count: i64,
+}
+#[cfg(any(target_os = "macos", test))]
+impl ClickSeries {
+    fn update(&mut self, down: bool, point: (i32, i32), now: Instant, interval: Duration) -> i64 {
+        if down {
+            self.count = if self.last_down.is_some_and(|(last, (x, y))| {
+                now.saturating_duration_since(last) < interval
+                    && x.abs_diff(point.0) <= 4
+                    && y.abs_diff(point.1) <= 4
+            }) {
+                self.count.saturating_add(1)
+            } else {
+                1
+            };
+            self.last_down = Some((now, point));
+        }
+        self.count.max(1)
+    }
 }
 
 struct Receiver {
@@ -37,8 +93,12 @@ struct Receiver {
     last_seen: Instant,
     flow: Option<ReceiverFlow>,
     layout: Option<(Layout, Instant)>,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     cursor: Option<((i32, i32), Instant)>,
+    #[cfg(target_os = "macos")]
+    clicks: [ClickSeries; 3],
+    #[cfg(target_os = "macos")]
+    double_click_interval: Duration,
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     enigo: enigo::Enigo,
     #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -47,27 +107,43 @@ struct Receiver {
     buttons: HashSet<enigo::Button>,
 }
 impl Receiver {
+    fn accept_activity(&mut self, now: Instant) -> Result<bool, String> {
+        if now.saturating_duration_since(self.last_seen) > SESSION_TIMEOUT {
+            return Err("Input control timed out; start it again.".into());
+        }
+        if self.flow.as_ref().is_some_and(|f| f.returned_at.is_some()) {
+            return Ok(false);
+        }
+        self.last_seen = now;
+        Ok(true)
+    }
+    fn matches(&self, peer: &str, session: Option<Uuid>) -> bool {
+        self.peer == peer && self.flow.as_ref().and_then(|flow| flow.session) == session
+    }
     fn release_all(&mut self) {
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         {
-            use enigo::{Direction, Keyboard, Mouse};
-            let keys: HashSet<enigo::Key> = self.codes.drain().map(|(_, key)| key).collect();
+            use enigo::{Direction, Keyboard};
+            let keys: HashSet<enigo::Key> = self.codes.values().copied().collect();
             for key in keys {
-                let _ = self.enigo.key(key, Direction::Release);
+                if self.enigo.key(key, Direction::Release).is_ok() {
+                    self.codes.retain(|_, held| *held != key);
+                }
             }
-            for button in self.buttons.drain() {
-                let _ = self.enigo.button(button, Direction::Release);
+            let buttons: Vec<_> = self.buttons.iter().copied().collect();
+            for button in buttons {
+                if self.button(button, false).is_ok() {
+                    self.buttons.remove(&button);
+                }
             }
         }
     }
 }
-impl Drop for Receiver {
-    fn drop(&mut self) {
-        self.release_all();
-    }
-}
 pub fn enabled(core: &Core, peer: &str) -> Result<(), String> {
     let data = core.data.lock().map_err(|_| "Settings lock unavailable.")?;
+    check_permission(&data, peer)
+}
+pub(super) fn check_permission(data: &crate::model::Persisted, peer: &str) -> Result<(), String> {
     if !data.settings.input_enabled
         || !data
             .peers
@@ -81,12 +157,23 @@ pub fn enabled(core: &Core, peer: &str) -> Result<(), String> {
     }
     Ok(())
 }
+pub fn reserve_input<'a>(
+    core: &'a Core,
+    peer: &str,
+) -> Result<std::sync::MutexGuard<'a, InputState>, String> {
+    let data = core.data.lock().map_err(|_| "Settings lock unavailable.")?;
+    check_permission(&data, peer)?;
+    core.input
+        .lock()
+        .map_err(|_| "Input lock unavailable.".into())
+}
 pub fn start_receiving(core: &Core, peer: &str) -> Result<(), String> {
-    start_session(core, peer, None)
+    start_session(core, peer, None, None)
 }
 pub fn start_flow_receiving(
     core: &Core,
     peer: &str,
+    session: Option<Uuid>,
     sender_edge: FlowEdge,
     entry: f64,
     clipboard: bool,
@@ -96,27 +183,13 @@ pub fn start_flow_receiving(
         core,
         peer,
         Some(ReceiverFlow {
+            session,
             watch: ReturnWatch::new(sender_edge),
             clipboard,
-            returned: false,
+            returned_at: None,
         }),
-    )?;
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
-    {
-        let mut state = core.input.lock().map_err(|_| "Input lock unavailable.")?;
-        if let Some(receiver) = state.receiving.as_mut().filter(|r| r.peer == peer) {
-            let point = receiver.layout()?.entry_point(
-                sender_edge.opposite(),
-                entry,
-                crate::flow::EDGE_INSET_PX,
-            );
-            if let Err(error) = receiver.move_to(point) {
-                state.receiving = None;
-                return Err(error);
-            }
-        }
-    }
-    Ok(())
+        Some((sender_edge.opposite(), entry)),
+    )
 }
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 impl Receiver {
@@ -134,18 +207,18 @@ impl Receiver {
             .ok_or_else(|| "Display layout is unavailable.".to_string())
     }
     fn position(&self) -> Result<(i32, i32), String> {
+        // Both platforms queue injected events. Integrate bursts from the last
+        // accepted point instead of reading a cursor still one event behind.
+        if let Some((point, at)) = self.cursor {
+            if at.elapsed() < INJECTED_CURSOR_TTL {
+                return Ok(point);
+            }
+        }
         #[cfg(target_os = "windows")]
-        return crate::screen::win::cursor()
-            .ok_or_else(|| "Pointer position is unavailable.".into());
+        return windows_pointer::cursor().ok_or_else(|| "Pointer position is unavailable.".into());
         #[cfg(target_os = "macos")]
         {
-            if let Some((point, at)) = self.cursor {
-                if at.elapsed() < INJECTED_CURSOR_TTL {
-                    return Ok(point);
-                }
-            }
-            let (x, y) =
-                crate::screen::mac::cursor().ok_or("Pointer position is unavailable.")?;
+            let (x, y) = crate::screen::mac::cursor().ok_or("Pointer position is unavailable.")?;
             Ok((x.floor() as i32, y.floor() as i32))
         }
     }
@@ -153,7 +226,9 @@ impl Receiver {
         #[cfg(target_os = "windows")]
         {
             let layout = self.layout()?;
-            crate::screen::win::move_absolute(point, layout)
+            windows_pointer::move_absolute(point, layout)?;
+            self.cursor = Some((point, Instant::now()));
+            Ok(())
         }
         #[cfg(target_os = "macos")]
         {
@@ -174,12 +249,60 @@ impl Receiver {
             Ok(())
         }
     }
+    fn button(&mut self, button: enigo::Button, down: bool) -> enigo::InputResult<()> {
+        #[cfg(target_os = "windows")]
+        {
+            use enigo::{Direction, Mouse};
+            self.enigo.button(
+                button,
+                if down {
+                    Direction::Press
+                } else {
+                    Direction::Release
+                },
+            )
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let number = match button {
+                enigo::Button::Left => 0,
+                enigo::Button::Right => 1,
+                enigo::Button::Middle => 2,
+                _ => return Err(enigo::InputError::Simulate("unsupported mouse button")),
+            };
+            // Even if a display disappears between the press and the release,
+            // send the up at the last posted point to balance the held button.
+            let point = self
+                .position()
+                .ok()
+                .or_else(|| {
+                    if down {
+                        None
+                    } else {
+                        self.cursor.map(|(point, _)| point)
+                    }
+                })
+                .ok_or(enigo::InputError::Simulate(
+                    "could not read the pointer position",
+                ))?;
+            let now = Instant::now();
+            let clicks =
+                self.clicks[number as usize].update(down, point, now, self.double_click_interval);
+            if !crate::macos::post_mouse_button(point, number, down, clicks) {
+                return Err(enigo::InputError::Simulate(
+                    "could not post the mouse button",
+                ));
+            }
+            self.cursor = Some((point, now));
+            Ok(())
+        }
+    }
 }
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 const INJECTED_CURSOR_TTL: Duration = Duration::from_millis(250);
 #[cfg(target_os = "windows")]
 fn platform_layout(_: &enigo::Enigo) -> Result<Layout, String> {
-    crate::screen::win::layout().ok_or_else(|| "Display layout is unavailable.".to_string())
+    windows_pointer::layout().ok_or_else(|| "Display layout is unavailable.".to_string())
 }
 #[cfg(target_os = "macos")]
 fn platform_layout(_: &enigo::Enigo) -> Result<Layout, String> {
@@ -189,14 +312,32 @@ fn platform_layout(_: &enigo::Enigo) -> Result<Layout, String> {
     not(any(target_os = "windows", target_os = "macos")),
     allow(unused_variables, unused_mut)
 )]
-fn start_session(core: &Core, peer: &str, flow: Option<ReceiverFlow>) -> Result<(), String> {
-    enabled(core, peer)?;
-    let mut state = core.input.lock().map_err(|_| "Input lock unavailable.")?;
+fn start_session(
+    core: &Core,
+    peer: &str,
+    flow: Option<ReceiverFlow>,
+    entry: Option<(FlowEdge, f64)>,
+) -> Result<(), String> {
+    let mut state = reserve_input(core, peer)?;
     if state.sending_to.is_some() {
         return Err(
             "This computer is already controlling another peer; stop it before receiving input."
                 .into(),
         );
+    }
+    // A new, tagged start from the same peer can follow its return before the
+    // old stop arrives. A late stop for that previous visit is harmless.
+    if state.receiving.as_ref().is_some_and(|r| {
+        r.peer == peer
+            && r.flow.as_ref().is_some_and(|old| {
+                old.returned_at.is_some()
+                    && old.session.is_some()
+                    && flow
+                        .as_ref()
+                        .is_some_and(|new| new.session.is_some() && new.session != old.session)
+            })
+    }) {
+        state.finish_receiving();
     }
     if state.receiving.is_some() {
         return Err("An input session is already active on this computer.".into());
@@ -206,61 +347,156 @@ fn start_session(core: &Core, peer: &str, flow: Option<ReceiverFlow>) -> Result<
         let settings = enigo::Settings {
             open_prompt_to_get_permissions: false,
             release_keys_when_dropped: true,
+            #[cfg(target_os = "macos")]
+            event_source_user_data: Some(crate::macos::INJECTED_MARKER),
             ..Default::default()
         };
-        let enigo = enigo::Enigo::new(&settings).map_err(|_| "Input access is unavailable. On macOS, allow TrapLink in System Settings > Privacy & Security > Accessibility, then retry.".to_string())?;
-        state.receiving = Some(Receiver {
+        let new_injector = || {
+            enigo::Enigo::new(&settings).map_err(|_| "Input access is unavailable. On macOS, allow TrapLink in System Settings > Privacy & Security > Accessibility, then retry.".to_string())
+        };
+        #[cfg(target_os = "macos")]
+        let enigo = {
+            if !crate::macos::accessibility_trusted(false) {
+                return Err(
+                    "Input access is unavailable. Allow TrapLink in macOS Accessibility settings."
+                        .into(),
+                );
+            }
+            state.idle_injector.take().map_or_else(new_injector, Ok)?
+        };
+        #[cfg(target_os = "windows")]
+        let enigo = new_injector()?;
+        let mut receiver = Receiver {
             peer: peer.into(),
             last_seen: Instant::now(),
             flow,
             layout: None,
-            #[cfg(target_os = "macos")]
             cursor: None,
+            #[cfg(target_os = "macos")]
+            clicks: std::array::from_fn(|_| ClickSeries::default()),
+            #[cfg(target_os = "macos")]
+            double_click_interval: crate::macos::double_click_interval(),
             enigo,
             codes: HashMap::new(),
             buttons: HashSet::new(),
-        });
+        };
+        if let Some((edge, fraction)) = entry {
+            let point = receiver
+                .layout()?
+                .entry_point(edge, fraction, crate::flow::EDGE_INSET_PX);
+            receiver.move_to(point)?;
+        }
+        state.receiving = Some(receiver);
         Ok(())
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     Err("Input receiving is supported on Windows and macOS only.".into())
 }
 pub fn active_with(core: &Core, peer: &str) -> bool {
-    core.input.lock().is_ok_and(|state| {
-        state.sending_to.as_deref() == Some(peer)
-            || state.receiving.as_ref().is_some_and(|r| r.peer == peer)
-            || state.flow.switch.peer() == Some(peer)
-    })
+    core.input
+        .lock()
+        .is_ok_and(|state| state.active_peer() == Some(peer))
 }
-pub fn stop_peer(core: &Core, peer: &str) {
+pub fn stop_peer(core: &Core, peer: &str) -> bool {
     if let Ok(mut state) = core.input.lock() {
+        let active = state.active_peer() == Some(peer);
         if state.receiving.as_ref().is_some_and(|r| r.peer == peer) {
-            state.receiving = None;
+            state.finish_receiving();
         }
         if state.sending_to.as_deref() == Some(peer) {
             state.sending_to = None;
+            state.pending_control = None;
         }
         crate::flow::session_ended(&mut state.flow, peer);
+        return active;
+    }
+    false
+}
+pub fn stop_receiving(core: &Core, peer: &str, session: Option<Uuid>) {
+    if let Ok(mut state) = core.input.lock() {
+        if state
+            .receiving
+            .as_ref()
+            .is_some_and(|r| r.matches(peer, session))
+        {
+            state.finish_receiving();
+        }
     }
 }
-pub fn stop_all(core: &Core) {
+pub fn stop_focused(core: &Core, peer: &str) {
     if let Ok(mut state) = core.input.lock() {
-        state.receiving = None;
-        state.sending_to = None;
-        crate::flow::disarm_all(&mut state.flow);
+        if state
+            .receiving
+            .as_ref()
+            .is_some_and(|r| r.peer == peer && r.flow.is_none())
+        {
+            state.finish_receiving();
+        }
+        if state.sending_to.as_deref() == Some(peer) && state.flow.switch.peer().is_none() {
+            state.sending_to = None;
+            state.pending_control = None;
+        }
     }
+}
+impl InputState {
+    fn active_peer(&self) -> Option<&str> {
+        self.sending_to
+            .as_deref()
+            .or_else(|| self.receiving.as_ref().map(|r| r.peer.as_str()))
+            .or_else(|| self.flow.switch.peer())
+    }
+    pub fn acknowledge_stop(&mut self, peer: &str, token: Uuid) {
+        if let Some(start) = self
+            .receiving
+            .as_ref()
+            .filter(|r| r.matches(peer, Some(token)))
+            .and_then(|r| r.flow.as_ref()?.returned_at)
+        {
+            self.last_return = Some(crate::flow::FlowTiming {
+                peer: peer.to_owned(),
+                elapsed_ms: start.elapsed().as_millis() as u64,
+            });
+        }
+        self.stop_flow(peer, token);
+    }
+    pub fn stop_flow(&mut self, peer: &str, token: Uuid) -> bool {
+        if self
+            .receiving
+            .as_ref()
+            .is_some_and(|r| r.matches(peer, Some(token)))
+        {
+            self.finish_receiving();
+            return true;
+        }
+        if self.flow.switch.peer() == Some(peer) && self.flow.switch_id() == Some(token) {
+            self.sending_to = None;
+            crate::flow::session_ended(&mut self.flow, peer);
+            return true;
+        }
+        false
+    }
+}
+pub fn stop_all(core: &Core) -> Option<String> {
+    if let Ok(mut state) = core.input.lock() {
+        let peer = state.active_peer().map(str::to_owned);
+        state.finish_receiving();
+        state.sending_to = None;
+        state.pending_control = None;
+        crate::flow::disarm_all(&mut state.flow);
+        return peer;
+    }
+    None
 }
 
-pub fn keepalive(core: &Core, peer: &str) -> Result<(), String> {
+pub fn keepalive(core: &Core, peer: &str, session: Option<Uuid>) -> Result<(), String> {
     enabled(core, peer)?;
     let mut state = core.input.lock().map_err(|_| "Input lock unavailable.")?;
     let receiver = state
         .receiving
         .as_mut()
-        .filter(|r| r.peer == peer)
-        .ok_or("Input control is not active.")?;
-    receiver.last_seen = Instant::now();
-    Ok(())
+        .filter(|r| r.matches(peer, session))
+        .ok_or(INACTIVE)?;
+    receiver.accept_activity(Instant::now()).map(|_| ())
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -399,6 +635,7 @@ pub fn validate(event: &InputEvent) -> Result<(), String> {
 pub fn receive(
     core: &Core,
     peer: &str,
+    session: Option<Uuid>,
     event: InputEvent,
 ) -> Result<Option<FlowReturnInfo>, String> {
     enabled(core, peer)?;
@@ -411,51 +648,48 @@ pub fn receive(
     let receiver = state
         .receiving
         .as_mut()
-        .filter(|r| r.peer == peer)
-        .ok_or("Input control is not active.")?;
-    if receiver.last_seen.elapsed() > Duration::from_secs(3) {
-        state.receiving = None;
-        return Err("Input control timed out; start it again.".into());
-    }
-    receiver.last_seen = Instant::now();
-    if unknown_key || receiver.flow.as_ref().is_some_and(|f| f.returned) {
+        .filter(|r| r.matches(peer, session))
+        .ok_or(INACTIVE)?;
+    if !receiver.accept_activity(Instant::now())? || unknown_key {
         return Ok(None);
     }
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     {
-        use enigo::{Axis, Button, Coordinate, Direction, Keyboard, Mouse};
+        use enigo::{Axis, Button, Direction, Keyboard, Mouse};
         let mut flow_return = None;
         let result = match event {
             InputEvent::Key { key: code, down } => {
-                let key = if down {
-                    let key = key(&code).ok_or("Unsupported key.")?;
-                    receiver.codes.insert(code, key);
-                    key
-                } else {
-                    let Some(key) = receiver.codes.remove(&code) else {
-                        return Ok(None);
-                    };
-                    if receiver.codes.values().any(|other| *other == key) {
-                        return Ok(None);
-                    }
-                    key
-                };
-                receiver.enigo.key(
-                    key,
-                    if down {
-                        Direction::Press
+                if down {
+                    let key = receiver
+                        .codes
+                        .get(&code)
+                        .copied()
+                        .or_else(|| key(&code))
+                        .ok_or("Unsupported key.")?;
+                    receiver.enigo.key(key, Direction::Press).map(|()| {
+                        receiver.codes.insert(code, key);
+                    })
+                } else if let Some(&key) = receiver.codes.get(&code) {
+                    let still_held = receiver
+                        .codes
+                        .iter()
+                        .any(|(other, value)| other != &code && *value == key);
+                    let release = if still_held {
+                        Ok(())
                     } else {
-                        Direction::Release
-                    },
-                )
+                        receiver.enigo.key(key, Direction::Release)
+                    };
+                    release.map(|()| {
+                        receiver.codes.remove(&code);
+                    })
+                } else {
+                    Ok(())
+                }
             }
             InputEvent::Move { x, y } => {
-                let (w, h) = receiver.enigo.main_display().map_err(|e| e.to_string())?;
-                receiver.enigo.move_mouse(
-                    (x * f64::from(w - 1)) as i32,
-                    (y * f64::from(h - 1)) as i32,
-                    Coordinate::Abs,
-                )
+                let point = receiver.layout()?.primary_point(x, y);
+                receiver.move_to(point)?;
+                Ok(())
             }
             InputEvent::MoveBy { dx, dy } => {
                 let position = receiver.position()?;
@@ -474,15 +708,13 @@ pub fn receive(
                     ),
                 };
                 if let (Some(entry), Some(flow)) = (crossed, receiver.flow.as_mut()) {
-                    flow.returned = true;
+                    flow.returned_at = Some(Instant::now());
                     flow_return = Some(FlowReturnInfo {
                         entry,
                         clipboard: flow.clipboard,
                     });
                 }
-                if let Err(error) = receiver.move_to(target) {
-                    return Err(error);
-                }
+                receiver.move_to(target)?;
                 Ok(())
             }
             InputEvent::Button { button, down } => {
@@ -491,24 +723,31 @@ pub fn receive(
                     1 => Button::Middle,
                     _ => Button::Right,
                 };
-                if down {
-                    receiver.buttons.insert(button);
-                } else {
-                    receiver.buttons.remove(&button);
+                if receiver.buttons.contains(&button) == down {
+                    return Ok(None);
                 }
-                receiver.enigo.button(
-                    button,
+                receiver.button(button, down).map(|()| {
                     if down {
-                        Direction::Press
+                        receiver.buttons.insert(button);
                     } else {
-                        Direction::Release
-                    },
-                )
+                        receiver.buttons.remove(&button);
+                    }
+                })
             }
-            InputEvent::Scroll { x, y } => receiver
-                .enigo
-                .scroll(x, Axis::Horizontal)
-                .and_then(|_| receiver.enigo.scroll(y, Axis::Vertical)),
+            InputEvent::Scroll { x, y } => {
+                let horizontal = if x == 0 {
+                    Ok(())
+                } else {
+                    receiver.enigo.scroll(x, Axis::Horizontal)
+                };
+                horizontal.and_then(|_| {
+                    if y == 0 {
+                        Ok(())
+                    } else {
+                        receiver.enigo.scroll(y, Axis::Vertical)
+                    }
+                })
+            }
         };
         if flow_return.is_some() {
             receiver.release_all();
@@ -521,8 +760,10 @@ pub fn receive(
     Err("Native input is unavailable on this platform.".into())
 }
 
-pub async fn watchdog(core: Arc<Core>) {
+pub async fn watchdog(core: Arc<Core>, changed: impl Fn(InputStatus)) {
     let mut timer = tokio::time::interval(Duration::from_millis(200));
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut previous = InputStatus::default();
     loop {
         timer.tick().await;
         let peer = core
@@ -533,28 +774,96 @@ pub async fn watchdog(core: Arc<Core>) {
         if let Some(peer) = peer {
             let allowed = enabled(&core, &peer).is_ok();
             if let Ok(mut state) = core.input.lock() {
-                if state
-                    .receiving
-                    .as_ref()
-                    .is_some_and(|r| !allowed || r.last_seen.elapsed() > Duration::from_secs(3))
-                {
-                    state.receiving = None;
+                if state.receiving.as_ref().is_some_and(|r| {
+                    r.peer == peer && (!allowed || r.last_seen.elapsed() > SESSION_TIMEOUT)
+                }) {
+                    state.finish_receiving();
                 }
             }
         }
+        let current = status(&core.input);
+        if current != previous {
+            previous = current.clone();
+            changed(current);
+        }
     }
 }
-pub fn status(state: &Mutex<InputState>) -> serde_json::Value {
-    if let Ok(state) = state.lock() {
-        serde_json::json!({"sendingTo":state.sending_to,"receivingFrom":state.receiving.as_ref().map(|r|r.peer.clone())})
-    } else {
-        serde_json::json!({"sendingTo":null,"receivingFrom":null})
+#[derive(Clone, Default, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InputStatus {
+    sending_to: Option<String>,
+    receiving_from: Option<String>,
+    connecting_to: Option<String>,
+    flow_session: Option<Uuid>,
+}
+
+pub fn status(state: &Mutex<InputState>) -> InputStatus {
+    let Ok(state) = state.lock() else {
+        return InputStatus::default();
+    };
+    let receiver = state
+        .receiving
+        .as_ref()
+        .filter(|r| !r.flow.as_ref().is_some_and(|f| f.returned_at.is_some()));
+    let connecting = state
+        .flow
+        .connecting()
+        .or_else(|| state.pending_control.and(state.sending_to.as_deref()));
+    InputStatus {
+        sending_to: state
+            .sending_to
+            .clone()
+            .filter(|peer| connecting != Some(peer)),
+        receiving_from: receiver.map(|r| r.peer.clone()),
+        connecting_to: connecting.map(str::to_owned),
+        flow_session: state
+            .flow
+            .switch_id()
+            .or_else(|| receiver.and_then(|r| r.flow.as_ref()?.session)),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mouse_clicks_preserve_count_on_release_and_expire() {
+        let mut clicks = ClickSeries::default();
+        let now = Instant::now();
+        let interval = Duration::from_millis(400);
+        let point = (-30, 90);
+        assert_eq!(clicks.update(true, point, now, interval), 1);
+        assert_eq!(
+            clicks.update(false, point, now + Duration::from_millis(20), interval),
+            1
+        );
+        assert_eq!(
+            clicks.update(true, (-29, 90), now + Duration::from_millis(100), interval),
+            2
+        );
+        assert_eq!(
+            clicks.update(false, point, now + Duration::from_millis(120), interval),
+            2
+        );
+        assert_eq!(
+            clicks.update(true, point, now + Duration::from_millis(501), interval),
+            1
+        );
+        assert_eq!(
+            clicks.update(true, (100, 90), now + Duration::from_millis(502), interval),
+            1
+        );
+        assert_eq!(
+            clicks.update(
+                true,
+                point,
+                now + Duration::from_millis(503),
+                Duration::ZERO
+            ),
+            1
+        );
+    }
     #[test]
     fn input_boundaries() {
         assert!(validate(&InputEvent::Move {

@@ -121,6 +121,54 @@
   .disclosure-chevron[data-open="true"] { transform: rotate(180deg); }
   .disclosure-content { display: flex; flex-direction: column; gap: 16px; }
   .flow-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+  .connection-peer-row [data-slot="item-content"] { min-width: min(13rem, 100%); overflow-wrap: anywhere; }
+  .connection-peer-actions { flex-wrap: wrap; }
+  .peer-control-state { align-self: flex-start; gap: 6px; }
+  .peer-control-state svg { width: 14px; height: 14px; flex-shrink: 0; }
+  .peer-dialog, .pairing-dialog { width: calc(100% - 32px); }
+  .peer-dialog { --peer-inset: 24px; display: flex; flex-direction: column; gap: 0; max-width: 42rem; padding: 0; overflow: hidden; border-radius: var(--radius); transition-property: opacity, transform; }
+  .peer-dialog-header { display: flex; flex-direction: row; flex-wrap: wrap; align-items: center; gap: 10px; padding: 20px calc(var(--peer-inset) + 26px) 16px var(--peer-inset); text-align: left; }
+  .peer-dialog-header .dialog-symbol { flex-shrink: 0; margin: 0; background: hsl(var(--muted)); }
+  .peer-dialog-identity { min-width: 0; flex: 1 1 140px; display: grid; gap: 4px; overflow-wrap: anywhere; }
+  .peer-dialog-identity h2 { line-height: 1.25; }
+  .peer-tabs { display: flex; flex-direction: column; min-height: 0; }
+  .peer-tabs > [role="tablist"] { width: auto; flex: none; margin: 0 var(--peer-inset) 12px; }
+  .peer-tab-content[data-state="active"] { display: flex; flex-direction: column; gap: 16px; margin: 0; padding: 4px var(--peer-inset) 16px; overflow: auto; overscroll-behavior: contain; scroll-padding-block: 8px; }
+  .peer-dialog-footer { flex: none; display: flex; flex-direction: row; flex-wrap: wrap; align-items: center; gap: 8px; padding: 12px var(--peer-inset); border-top: 1px solid hsl(var(--border)); }
+  .peer-dialog-footer > button:first-child { margin-right: auto; }
+  .flow-control { min-width: 0; overflow-wrap: anywhere; }
+  .flow-heading { align-items: center; }
+  .flow-state-panel { display: grid; gap: 6px; padding: 12px 14px; border: 1px solid hsl(var(--border)); border-radius: var(--radius); background: hsl(var(--muted) / .45); }
+  .flow-state-heading { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; font-variant-numeric: tabular-nums; }
+  .flow-state-panel p, .flow-settings [data-slot="field-description"] { font-size: 13px; line-height: 1.5; color: hsl(var(--muted-foreground)); }
+  .flow-state-panel > button { justify-self: start; margin-top: 4px; }
+  .flow-latency { margin-inline-start: auto; color: hsl(var(--muted-foreground)); font-size: 12px; }
+  .flow-timings { display: flex; flex-wrap: wrap; column-gap: 16px; row-gap: 2px; margin-top: 2px; font-size: 12px; }
+  .flow-timings > div { display: flex; flex-wrap: wrap; align-items: baseline; gap: 5px; min-width: 0; }
+  .flow-timings dt { color: hsl(var(--muted-foreground)); overflow-wrap: anywhere; }
+  .flow-timings dd { font-weight: 600; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .flow-settings { display: grid; grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr); gap: 16px 20px; align-items: start; }
+  .flow-settings > [data-slot="field"] { min-width: 0; gap: 6px; }
+  .flow-settings > [data-slot="field"]:first-child { grid-row: span 2; }
+  .flow-edge-map { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); grid-template-areas: ". top ." "left local right" ". bottom ."; gap: 6px; align-items: stretch; padding: 10px; margin-top: 2px; border-radius: var(--radius); background: hsl(var(--muted) / .6); }
+  .flow-edge-option[data-edge="top"] { grid-area: top; }
+  .flow-edge-option[data-edge="left"] { grid-area: left; }
+  .flow-edge-option[data-edge="right"] { grid-area: right; }
+  .flow-edge-option[data-edge="bottom"] { grid-area: bottom; }
+  .flow-edge-option { min-width: 0; height: auto; min-height: 44px; padding: 4px; gap: 3px; line-height: 1.15; background: hsl(var(--background)); }
+  .flow-edge-option span { display: grid; gap: 2px; }
+  .flow-edge-option small { font-size: 10px; font-weight: 400; }
+  .flow-settings .flow-edge-option[data-state="on"], .flow-settings .flow-mode-options > [data-state="on"] { border-color: hsl(var(--primary)); background: hsl(var(--primary)); color: hsl(var(--primary-foreground)); }
+  .flow-edge-option:focus-visible, .flow-mode-options > button:focus-visible { outline: 2px solid hsl(var(--foreground)); outline-offset: 2px; }
+  .flow-local-screen { grid-area: local; display: grid; justify-items: center; align-content: center; gap: 3px; text-align: center; color: hsl(var(--foreground)); font-size: 11px; line-height: 1.2; }
+  .flow-local-screen svg { width: 24px; height: 24px; stroke-width: 1.6; }
+  .flow-mode-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
+  .flow-mode-options > button, .flow-delay-select { min-height: 40px; }
+  .flow-delay-select { font-variant-numeric: tabular-nums; }
+  .flow-return-note { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; font-size: 13px; font-weight: 500; }
+  .flow-return-note > div { display: inline-flex; gap: 4px; align-items: center; color: hsl(var(--muted-foreground)); }
+  .flow-return-note > p { flex-basis: 100%; color: hsl(var(--muted-foreground)); font-size: 12px; font-weight: 400; }
+  .flow-control > .input-control-note { margin: 0; }
   .hardware-grid, .profiles-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
   .hardware-card, .profile-card { min-width: 0; }
   .hardware-card h3, .profile-card h3 { overflow-wrap: anywhere; }
@@ -239,6 +287,17 @@
   .page-heading { gap: 16px; flex-direction: column; margin-bottom: 24px; }
   .page-actions { width: 100%; }
   .connections-grid, .backup-layout, .content-stack { gap: 20px; }
+}
+@media (max-width: 570px) {
+  .peer-dialog { --peer-inset: 16px; }
+  .flow-settings { grid-template-columns: minmax(0, 1fr); }
+  .flow-settings > [data-slot="field"]:first-child { grid-row: auto; }
+  .flow-edge-map { grid-template-columns: repeat(3, minmax(0, 7rem)); }
+  .flow-edge-option, .flow-mode-options > button, .flow-delay-select { min-height: 44px; }
+}
+@media (max-height: 440px) {
+  .peer-dialog { max-height: calc(100dvh - 12px); overflow: auto; }
+  .peer-tabs, .peer-tab-content[data-state="active"] { flex: none; overflow: visible; }
 }
 @media (max-width: 480px) {
   .main-content { padding-inline: 16px; }

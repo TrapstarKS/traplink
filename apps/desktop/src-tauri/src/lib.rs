@@ -146,7 +146,7 @@ async fn update_settings(
         changed
     };
     if port_changed || input_revoked {
-        input::stop_all(&state);
+        release_all_input(&state);
     }
     if port_changed || input_revoked || input_turned_on {
         flow::restore_saved(state.inner());
@@ -267,7 +267,6 @@ fn create_backup(name: String, state: AppState<'_>) -> Result<Backup, String> {
 }
 fn restore(doc: storage::BackupDocument, core: &Core) -> Result<Snapshot, String> {
     doc.validate()?;
-    input::stop_all(core);
     {
         let mut data = core.data.lock().map_err(|_| "Settings lock unavailable.")?;
         let mut updated = data.clone();
@@ -282,6 +281,7 @@ fn restore(doc: storage::BackupDocument, core: &Core) -> Result<Snapshot, String
         storage::save(&core.directory, &updated)?;
         *data = updated;
     }
+    release_all_input(core);
     reload_remap(core);
     core.snapshot()
 }
@@ -414,7 +414,10 @@ fn set_peer_permissions(
     *data = updated;
     drop(data);
     if revoked {
-        input::stop_peer(&state, &id);
+        let active = input::stop_peer(&state, &id);
+        if let Ok(link) = network::session(&state, &id) {
+            link.notify_input_stop(active);
+        }
     }
     Ok(())
 }
@@ -510,8 +513,16 @@ async fn input_keepalive(peer_id: String, state: AppState<'_>) -> Result<(), Str
     network::send_input(state.inner().clone(), &peer_id, None).await
 }
 #[tauri::command]
-fn get_input_status(state: AppState<'_>) -> serde_json::Value {
+fn get_input_status(state: AppState<'_>) -> input::InputStatus {
     input::status(&state.input)
+}
+#[tauri::command]
+async fn release_flow_control(
+    peer_id: String,
+    session: uuid::Uuid,
+    state: AppState<'_>,
+) -> Result<(), String> {
+    network::release_flow_control(&state, &peer_id, session).await
 }
 #[tauri::command]
 fn emergency_stop(state: AppState<'_>) {
@@ -558,19 +569,26 @@ fn sync_start_on_login(core: &Core, enabled: bool) {
     }
 }
 fn stop_all_input(core: &Core, turn_off: bool) {
-    input::stop_all(core);
     if turn_off {
         if let Ok(mut data) = core.data.lock() {
             data.settings.input_enabled = false;
+            let active = input::stop_all(core);
             let _ = storage::save(&core.directory, &data);
+            drop(data);
+            notify_input_stopped(core, active.as_deref());
+            return;
         }
     }
+    release_all_input(core);
+}
+fn release_all_input(core: &Core) {
+    let active = input::stop_all(core);
+    notify_input_stopped(core, active.as_deref());
+}
+fn notify_input_stopped(core: &Core, active: Option<&str>) {
     if let Ok(sessions) = core.sessions.lock() {
-        for session in sessions.values() {
-            let _ = session.tx.try_send(network::Outgoing {
-                message: network::Wire::ControlStop,
-                result: None,
-            });
+        for (id, session) in sessions.iter() {
+            session.notify_input_stop(active == Some(id.as_str()));
         }
     }
 }
@@ -665,7 +683,11 @@ pub fn run() {
             remap::init(core.clone());
             let restoring = core.clone();
             tauri::async_runtime::spawn(async move { flow::restore_saved(&restoring) });
-            tauri::async_runtime::spawn(input::watchdog(core));
+            let input_window = app.handle().clone();
+            tauri::async_runtime::spawn(input::watchdog(core, move |status| {
+                use tauri::Emitter;
+                let _ = input_window.emit("input-status-changed", status);
+            }));
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -727,6 +749,7 @@ pub fn run() {
             send_input,
             input_keepalive,
             get_input_status,
+            release_flow_control,
             flow::set_flow,
             flow::get_flow_status,
             flow::repair_flow,

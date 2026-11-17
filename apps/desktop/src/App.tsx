@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useState } from "react";
 import type { LucideIcon } from "lucide-react";
 import { BookOpen, CircleHelp, CircleUserRound, FileSliders, FolderArchive, Info, Laptop, Link2, Moon, Plus, RefreshCw, Search, Settings2, ShieldCheck, Sun, Usb } from "lucide-react";
 import { Toaster, toast } from "sonner";
@@ -18,12 +18,23 @@ import { useDesktop } from "@/lib/use-desktop";
 import { InputConsentPrompt } from "@/components/InputConsentPrompt";
 import { messageFrom, nativeCommand, type Settings } from "@/lib/bridge";
 import { checkOnStartup, requestUpdatesFocus } from "@/lib/updater";
-import { Account } from "@/pages/Account";
-import { Backups } from "@/pages/Backups";
 import { Connections } from "@/pages/Connections";
-import { Devices } from "@/pages/Devices";
-import { Preferences } from "@/pages/Preferences";
-import { Profiles } from "@/pages/Profiles";
+
+const Account = lazy(() => import("@/pages/Account").then(module => ({ default: module.Account }), failedPage));
+const Backups = lazy(() => import("@/pages/Backups").then(module => ({ default: module.Backups }), failedPage));
+const Devices = lazy(() => import("@/pages/Devices").then(module => ({ default: module.Devices }), failedPage));
+const Preferences = lazy(() => import("@/pages/Preferences").then(module => ({ default: module.Preferences }), failedPage));
+const Profiles = lazy(() => import("@/pages/Profiles").then(module => ({ default: module.Profiles }), failedPage));
+
+function failedPage() {
+  return { default: () => <EmptyState icon={Info} title="Couldn't open this page" description="Reload the app to open this page again.">
+    <Button variant="outline" onClick={() => window.location.reload()}><RefreshCw data-icon="inline-start" />Reload app</Button>
+  </EmptyState> };
+}
+
+function PageLoading({ label }: { label: string }) {
+  return <div className="loading-layout" role="status" aria-busy="true" aria-label={label}><Skeleton className="h-8 w-40" /><Skeleton className="h-4 w-1/2" /><Skeleton className="mt-4 h-56 w-full" /></div>;
+}
 
 export type Page = "connections" | "devices" | "profiles" | "backups" | "preferences" | "account";
 export type Intent = { kind: "pair" | "new-profile" | "new-backup"; nonce: number };
@@ -60,12 +71,16 @@ function storedSidebar() {
 export default function App() {
   const desktop = useDesktop();
   const [page, setPage] = useState<Page>(storedPage);
+  // Once opened, keep the account login poll and unsaved preference fields mounted.
+  const [openedPanels, setOpenedPanels] = useState(() => ({ account: page === "account", preferences: page === "preferences" }));
   const [help, setHelp] = useState(false);
   const [palette, setPalette] = useState(false);
   const [intent, setIntent] = useState<Intent | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(storedSidebar);
   const [previewTheme, setPreviewTheme] = useState<Theme>("system");
-  const seenInput = useRef<string | null>(null);
+  const { sendingTo, receivingFrom, connectingTo, flowSession } = desktop.inputStatus;
+  const controlPeer = receivingFrom ?? sendingTo ?? connectingTo;
+  const controlName = desktop.snapshot?.peers.find(peer => peer.id === controlPeer)?.name ?? "the paired computer";
   const theme = desktop.native ? desktop.snapshot?.settings.theme ?? "dark" : previewTheme;
   const current = pages.find(item => item.id === page);
 
@@ -80,14 +95,10 @@ export default function App() {
     return () => system.removeEventListener("change", updateTheme);
   }, [theme]);
 
-  useEffect(() => {
-    const incoming = desktop.inputStatus.receivingFrom;
-    if (incoming && incoming !== seenInput.current) document.getElementById("main-content")?.focus({ preventScroll: true });
-    seenInput.current = incoming;
-  }, [desktop.inputStatus.receivingFrom]);
-
   const navigate = useCallback((next: Page) => {
     setPage(next);
+    setIntent(null);
+    if (next === "account" || next === "preferences") setOpenedPanels(opened => opened[next] ? opened : { ...opened, [next]: true });
     try { localStorage.setItem("traplink.page", next); } catch {  }
     document.getElementById("main-content")?.scrollTo({ top: 0 });
     window.scrollTo({ top: 0, behavior: "instant" });
@@ -153,26 +164,38 @@ export default function App() {
               <KbdGroup className="hidden md:inline-flex"><Kbd>{mod}</Kbd><Kbd>K</Kbd></KbdGroup>
             </Button>
             <span className="hidden lg:inline-flex"><StatusBadge active={desktop.native && !!desktop.snapshot?.listening}>{desktop.native ? desktop.snapshot ? desktop.snapshot.listening ? "Available on network" : "Network unavailable" : "Loading…" : "Browser preview"}</StatusBadge></span>
-            {desktop.native && desktop.capabilities.inputSharing ? <Button variant={desktop.inputStatus.receivingFrom ? "destructive" : "outline"} size="sm" onClick={() => void desktop.run("emergency-stop", () => nativeCommand("emergency_stop"), "Input control stopped.", { concurrent: true })}>Stop input</Button> : null}
+            {desktop.native && desktop.capabilities.inputSharing && (desktop.snapshot?.settings.inputEnabled || desktop.snapshot?.settings.remapEnabled || controlPeer) ? <Button variant={controlPeer ? "destructive" : "outline"} size="sm" onClick={() => void desktop.run("emergency-stop", () => nativeCommand("emergency_stop"), "Input sharing and button remapping turned off.", { concurrent: true })}>Emergency stop</Button> : null}
           </div>
         </header>
         <main id="main-content" className="main-content" tabIndex={-1}>
           {!desktop.native ? <NativeNotice /> : null}
-          {desktop.inputStatus.receivingFrom ? <Alert className="receiving-input"><ShieldCheck /><AlertTitle>Receiving input control</AlertTitle><AlertDescription>Use “Stop input” or {emergencyKeys.join(" + ")} to stop receiving.</AlertDescription></Alert> : null}
+          {controlPeer ? <Alert role="status" className="receiving-input">
+            <ShieldCheck aria-hidden="true" />
+            <AlertTitle>{receivingFrom ? `${controlName} is controlling this computer` : sendingTo ? `Controlling ${controlName}` : `Switching to ${controlName}…`}</AlertTitle>
+            <AlertDescription className="flex flex-wrap items-center justify-between gap-2">
+              <span>Press {emergencyKeys.join(" + ")} for an emergency stop.</span>
+              {flowSession && !connectingTo ? <Button size="sm" variant="outline" disabled={desktop.busy === "release-flow"} onClick={() => void desktop.returnControl(controlPeer, flowSession)}>Return control</Button> : null}
+            </AlertDescription>
+          </Alert> : null}
           {desktop.snapshot?.warnings?.length ? <Alert className="connection-error"><Info /><AlertTitle>Some features need attention</AlertTitle><AlertDescription><ul className="list-disc pl-4">{desktop.snapshot.warnings.map((warning, index) => <li key={index}>{messageFrom(warning)}</li>)}</ul></AlertDescription></Alert> : null}
           {desktop.error ? <Alert variant="destructive" className="connection-error"><Info /><AlertTitle>Couldn't refresh the app</AlertTitle><AlertDescription>{desktop.error}<Button size="sm" variant="outline" onClick={() => void desktop.refresh()}>Try again</Button></AlertDescription></Alert> : null}
           <div key={page} className="page-enter">
-            {desktop.loading ? <div className="loading-layout" aria-busy="true" aria-label="Loading app"><Skeleton className="h-8 w-40" /><Skeleton className="h-4 w-1/2" /><Skeleton className="mt-4 h-56 w-full" /><Skeleton className="h-40 w-full" /></div>
-              : !ready ? <EmptyState icon={Info} title="Couldn't load your data" description="Try refreshing the app to access your connections, devices and settings."><Button variant="outline" onClick={() => void desktop.refresh()}><RefreshCw data-icon="inline-start" />Try again</Button></EmptyState>
-              : page === "connections" ? <Connections desktop={desktop} intent={intent} onIntentDone={clearIntent} />
-              : page === "devices" ? <Devices desktop={desktop} onProfiles={() => navigate("profiles")} />
-              : page === "profiles" ? <Profiles desktop={desktop} intent={intent} onIntentDone={clearIntent} />
-              : page === "backups" ? <Backups desktop={desktop} onAccount={() => navigate("account")} intent={intent} onIntentDone={clearIntent} />
-              : null}
+            <Suspense fallback={<PageLoading label={`Loading ${current?.label ?? "page"}`} />}>
+              {desktop.loading ? <PageLoading label="Loading app" />
+                : !ready ? <EmptyState icon={Info} title="Couldn't load your data" description="Try refreshing the app to access your connections, devices and settings."><Button variant="outline" onClick={() => void desktop.refresh()}><RefreshCw data-icon="inline-start" />Try again</Button></EmptyState>
+                : page === "connections" ? <Connections desktop={desktop} intent={intent} onIntentDone={clearIntent} />
+                : page === "devices" ? <Devices desktop={desktop} onProfiles={() => navigate("profiles")} />
+                : page === "profiles" ? <Profiles desktop={desktop} intent={intent} onIntentDone={clearIntent} />
+                : page === "backups" ? <Backups desktop={desktop} onAccount={() => navigate("account")} intent={intent} onIntentDone={clearIntent} />
+                : null}
+            </Suspense>
           </div>
-          {}
-          <div hidden={page !== "account" || !ready}><Account desktop={desktop} onPreferences={() => navigate("preferences")} /></div>
-          <div hidden={page !== "preferences" || !ready}><Preferences desktop={desktop} /></div>
+          {openedPanels.account && <div hidden={page !== "account" || !ready}>
+            <Suspense fallback={<PageLoading label="Loading account" />}><Account desktop={desktop} onPreferences={() => navigate("preferences")} /></Suspense>
+          </div>}
+          {openedPanels.preferences && <div hidden={page !== "preferences" || !ready}>
+            <Suspense fallback={<PageLoading label="Loading preferences" />}><Preferences desktop={desktop} /></Suspense>
+          </div>}
         </main>
       </SidebarInset>
     </SidebarProvider>
@@ -260,5 +283,31 @@ function CommandMenu({ open, onOpenChange, desktop, theme, onNavigate, onRequest
 }
 
 function HelpDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (value: boolean) => void }) {
-  return <Dialog open={open} onOpenChange={onOpenChange}><DialogContent className="help-dialog"><DialogHeader><div className="dialog-symbol"><BookOpen /></div><DialogTitle>Connect two computers</DialogTitle><DialogDescription>Start with both computers on the same local network.</DialogDescription></DialogHeader><ol className="help-steps"><li><span>1</span><div><h3>Open TrapLink on both computers</h3><p>Use the desktop app for Windows or macOS. The browser preview can't access your hardware.</p></div></li><li><span>2</span><div><h3>Create an invitation in Connections</h3><p>On the other computer, choose “Use an invitation” and paste the full invitation.</p></div></li><li><span>3</span><div><h3>Choose what to share</h3><p>Turn on Files or Clipboard in Preferences and allow receiving on the paired computer.</p></div></li></ol><Alert><ShieldCheck /><AlertTitle>You decide when to share</AlertTitle><AlertDescription>Sending files and text is manual. Mouse and keyboard control requires permission and an explicit session, ended with Escape.</AlertDescription></Alert><div className="help-shortcuts"><h3>Shortcuts</h3><dl><div><dt>Search or run</dt><dd><KbdGroup><Kbd>{mod}</Kbd><Kbd>K</Kbd></KbdGroup></dd></div><div><dt>Go to a page</dt><dd><KbdGroup><Kbd>{mod}</Kbd><Kbd>1–4</Kbd></KbdGroup></dd></div><div><dt>Preferences</dt><dd><KbdGroup><Kbd>{mod}</Kbd><Kbd>,</Kbd></KbdGroup></dd></div><div><dt>Collapse sidebar</dt><dd><KbdGroup><Kbd>{mod}</Kbd><Kbd>B</Kbd></KbdGroup></dd></div><div><dt>Stop receiving</dt><dd><KbdGroup>{emergencyKeys.map(key => <Kbd key={key}>{key}</Kbd>)}</KbdGroup></dd></div></dl></div></DialogContent></Dialog>;
+  const shortcuts = [
+    ["Search or run", [mod, "K"]],
+    ["Go to a page", [mod, "1–4"]],
+    ["Preferences", [mod, ","]],
+    ["Collapse sidebar", [mod, "B"]],
+    ["Emergency stop", emergencyKeys],
+  ] as const;
+  return <Dialog open={open} onOpenChange={onOpenChange}>
+    <DialogContent className="help-dialog">
+      <DialogHeader>
+        <div className="dialog-symbol"><BookOpen aria-hidden="true" /></div>
+        <DialogTitle>Connect two computers</DialogTitle>
+        <DialogDescription>Open the TrapLink desktop app on both computers on the same local network.</DialogDescription>
+      </DialogHeader>
+      <ol className="help-steps">
+        <li><span>1</span><div><h3>Create an invite</h3><p>In Connections, choose Connect computer, then Create invite.</p></div></li>
+        <li><span>2</span><div><h3>Pair the other computer</h3><p>Open Use an invite on the other computer and paste the full invite.</p></div></li>
+        <li><span>3</span><div><h3>Choose the screen edge</h3><p>Under Manage, choose the side facing the other screen, then turn on Flow. Approve the request on the other computer.</p></div></li>
+      </ol>
+      <Alert role="note"><ShieldCheck aria-hidden="true" /><AlertTitle>Take control back</AlertTitle>
+        <AlertDescription>Push back through the edge you entered, or choose Return control during a Flow session. Emergency stop turns off input sharing and button remapping.</AlertDescription>
+      </Alert>
+      <div className="help-shortcuts"><h3>Shortcuts</h3><dl>{shortcuts.map(([label, keys]) =>
+        <div key={label}><dt>{label}</dt><dd><KbdGroup>{keys.map(key => <Kbd key={key}>{key}</Kbd>)}</KbdGroup></dd></div>
+      )}</dl></div>
+    </DialogContent>
+  </Dialog>;
 }

@@ -5488,7 +5488,7 @@ dependencies = [
 
 [[package]]
 name = "traplink"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "arboard",
  "argon2",
@@ -5499,6 +5499,7 @@ dependencies = [
  "hidapi",
  "keyring",
  "local-ip-address",
+ "objc2-app-kit",
  "rand 0.8.8",
  "reqwest 0.12.28",
  "rfd",

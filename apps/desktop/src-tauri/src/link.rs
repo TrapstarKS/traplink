@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant, SystemTime};
 
-pub const PROTOCOL: u32 = crate::consent::PROTOCOL;
+pub const SCOPED_FLOW: u32 = 4;
+pub const PROTOCOL: u32 = SCOPED_FLOW;
 pub const PROBING: u32 = 2;
 pub const PROBE_INTERVAL: Duration = Duration::from_secs(1);
 pub const TIE_BREAK: Duration = Duration::from_millis(1500);

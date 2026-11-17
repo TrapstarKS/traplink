@@ -53,6 +53,14 @@ impl Layout {
             bottom: a.bottom.max(b.bottom),
         })
     }
+    #[cfg(any(target_os = "macos", target_os = "windows", test))]
+    pub fn primary_point(&self, x: f64, y: f64) -> (i32, i32) {
+        let bounds = self.monitor_for((0, 0));
+        (
+            bounds.left + (x * f64::from(bounds.right - bounds.left)).round() as i32,
+            bounds.top + (y * f64::from(bounds.bottom - bounds.top)).round() as i32,
+        )
+    }
     pub fn monitor_for(&self, p: (i32, i32)) -> &Bounds {
         self.monitors
             .iter()
@@ -193,7 +201,10 @@ pub fn pointer_sample(layout: &Layout, location: (f64, f64), delta: (f64, f64)) 
         if !d.is_finite() || d == 0.0 {
             0
         } else {
-            (d.abs().round().clamp(1.0, f64::from(crate::flow::MAX_DELTA)) as i32) * d.signum() as i32
+            (d.abs()
+                .round()
+                .clamp(1.0, f64::from(crate::flow::MAX_DELTA)) as i32)
+                * d.signum() as i32
         }
     };
     let (sx, sy) = (step(delta.0), step(delta.1));
@@ -213,6 +224,20 @@ pub fn pointer_sample(layout: &Layout, location: (f64, f64), delta: (f64, f64)) 
     out
 }
 
+#[cfg(any(target_os = "macos", test))]
+pub fn accumulate_delta(residual: &mut (f64, f64), (dx, dy): (f64, f64)) -> (i32, i32) {
+    let limit = f64::from(crate::flow::MAX_DELTA);
+    let add = |acc: &mut f64, d: f64| {
+        if d.is_finite() {
+            *acc = (*acc + d).clamp(-limit, limit);
+        }
+        let whole = acc.trunc();
+        *acc -= whole;
+        whole as i32
+    };
+    (add(&mut residual.0, dx), add(&mut residual.1, dy))
+}
+
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn normalize_absolute(x: i32, origin: i32, size: i32) -> i32 {
     let size = i64::from(size.max(1));
@@ -229,10 +254,6 @@ pub mod win {
         Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO},
         UI::{
             HiDpi::{SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2},
-            Input::KeyboardAndMouse::{
-                SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_MOVE,
-                MOUSEEVENTF_VIRTUALDESK, MOUSEINPUT,
-            },
             WindowsAndMessaging::{
                 GetCursorPos, GetSystemMetrics, SetCursorPos, SM_CMONITORS, SM_CXVIRTUALSCREEN,
                 SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
@@ -293,9 +314,9 @@ pub mod win {
         let mut point = POINT { x: 0, y: 0 };
         (unsafe { GetCursorPos(&mut point) } != 0).then_some((point.x, point.y))
     }
-    pub fn set_cursor((x, y): (i32, i32)) {
+    pub fn set_cursor((x, y): (i32, i32)) -> bool {
         dpi_aware();
-        unsafe { SetCursorPos(x, y) };
+        unsafe { SetCursorPos(x, y) != 0 }
     }
     pub fn vk_for_scan(scan: u16, extended: bool) -> Option<u16> {
         use windows_sys::Win32::UI::{
@@ -314,7 +335,12 @@ pub mod win {
             u16::try_from(vk).ok().filter(|vk| *vk != 0)
         }
     }
+    #[cfg(not(test))]
     pub fn move_absolute((x, y): (i32, i32), layout: &Layout) -> Result<(), String> {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+            SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_MOVE,
+            MOUSEEVENTF_VIRTUALDESK, MOUSEINPUT,
+        };
         dpi_aware();
         let v = layout.virtual_bounds();
         let input = INPUT {
@@ -349,8 +375,11 @@ pub mod mac {
     pub fn cursor() -> Option<(f64, f64)> {
         crate::macos::cursor().map(|p| (p.x, p.y))
     }
-    pub fn set_cursor(point: (i32, i32)) {
-        crate::macos::warp(point, true);
+    pub fn set_cursor(point: (i32, i32)) -> bool {
+        let placed = crate::macos::warp(point);
+        // End Quartz's post-warp delay as soon as local control resumes.
+        crate::macos::associate(true);
+        placed
     }
 }
 
@@ -451,19 +480,50 @@ mod tests {
     }
 
     #[test]
+    fn normalized_mac_input_uses_primary_display_points() {
+        let l = layout_from_rects(&[(0.0, 0.0, 1512.0, 982.0), (-1920.0, -100.0, 1920.0, 1080.0)])
+            .unwrap();
+        assert_eq!(l.primary_point(0.0, 0.0), (0, 0));
+        assert_eq!(l.primary_point(1.0, 1.0), (1511, 981));
+        assert_eq!(l.primary_point(0.5, 0.5), (756, 491));
+    }
+
+    #[test]
+    fn fractional_relative_motion_accumulates_and_reverses() {
+        let mut residual = (0.0, 0.0);
+        assert_eq!(accumulate_delta(&mut residual, (0.4, -0.6)), (0, 0));
+        assert_eq!(accumulate_delta(&mut residual, (0.4, -0.6)), (0, -1));
+        assert_eq!(accumulate_delta(&mut residual, (0.4, 2.0)), (1, 1));
+        assert!((residual.0 - 0.2).abs() < 1e-9 && (residual.1 - 0.8).abs() < 1e-9);
+        assert_eq!(accumulate_delta(&mut residual, (-0.2, -0.8)), (0, 0));
+        assert!(residual.0.abs() < 1e-9 && residual.1.abs() < 1e-9);
+        assert_eq!(accumulate_delta(&mut residual, (f64::NAN, 0.0)), (0, 0));
+        assert_eq!(
+            accumulate_delta(&mut residual, (1e9, 0.0)).0,
+            crate::flow::MAX_DELTA
+        );
+    }
+
+    #[test]
     fn clamped_pointer_reports_push_past_outer_edges() {
         let l = mixed();
         assert_eq!(pointer_sample(&l, (500.4, 300.9), (3.0, -2.0)), (500, 300));
         assert_eq!(pointer_sample(&l, (1919.6, 540.0), (4.2, 0.0)), (1923, 540));
         assert_eq!(pointer_sample(&l, (1919.0, 540.0), (0.3, 0.0)), (1920, 540));
-        assert_eq!(pointer_sample(&l, (1919.0, 540.0), (-2.0, 5.0)), (1919, 540));
+        assert_eq!(
+            pointer_sample(&l, (1919.0, 540.0), (-2.0, 5.0)),
+            (1919, 540)
+        );
         assert_eq!(pointer_sample(&l, (0.0, 500.0), (-6.0, 0.0)), (0, 500));
         assert_eq!(pointer_sample(&l, (100.0, 0.0), (0.0, -3.0)), (100, -3));
         assert_eq!(
             pointer_sample(&l, (-2560.0, -360.0), (-2.0, -2.0)),
             (-2562, -362)
         );
-        assert_eq!(pointer_sample(&l, (f64::NAN, 5.0), (f64::INFINITY, 0.0)), (0, 5));
+        assert_eq!(
+            pointer_sample(&l, (f64::NAN, 5.0), (f64::INFINITY, 0.0)),
+            (0, 5)
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use crate::{
     link,
     model::{FlowEdge, FlowMode, InputEvent, SavedFlow},
-    network::Wire,
+    network::{FlowPacket, Session},
     screen::Layout,
     state::Core,
 };
@@ -11,6 +11,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use uuid::Uuid;
 
 mod pressed;
 use pressed::{ButtonTracker, KeyTracker, Route, MODIFIER_IDS};
@@ -126,6 +127,32 @@ pub struct EdgeTracker {
     last: Option<(i32, i32)>,
     inside: Option<(i32, i32)>,
     armed: bool,
+    crossing: Option<Crossing>,
+}
+#[derive(Clone, Copy, Debug)]
+struct Crossing {
+    at: Instant,
+    entry: f64,
+    display: Bounds,
+}
+impl Crossing {
+    fn contains(&self, edge: FlowEdge, layout: &Layout, point: (i32, i32)) -> bool {
+        let display = layout.monitor_for(point);
+        if *display != self.display || display.distance(edge, point) >= REARM_PX {
+            return false;
+        }
+        // The pointer can slide along an exposed edge into a seam without
+        // its perpendicular distance changing. The seam is a local route.
+        let boundary = match edge {
+            FlowEdge::Left => (display.left, point.1),
+            FlowEdge::Right => (display.right, point.1),
+            FlowEdge::Top => (point.0, display.top),
+            FlowEdge::Bottom => (point.0, display.bottom),
+        };
+        layout
+            .outer_edge_overshoot_from(edge, boundary, point)
+            .is_some()
+    }
 }
 impl EdgeTracker {
     pub fn new(config: FlowConfig) -> Self {
@@ -136,10 +163,22 @@ impl EdgeTracker {
             last: None,
             inside: None,
             armed: true,
+            crossing: None,
         }
     }
     pub fn disarm_until_leave(&mut self) {
+        self.crossing = None;
         self.armed = false;
+        self.since = None;
+        self.pushes = 0;
+    }
+    fn rearm_after_return(&mut self, point: (i32, i32)) {
+        // A successful return places the cursor just inside this edge. The
+        // next physical crossing is a new visit, even if it reverses at once.
+        self.armed = true;
+        self.crossing = None;
+        self.last = Some(point);
+        self.inside = Some(point);
         self.since = None;
         self.pushes = 0;
     }
@@ -183,8 +222,14 @@ impl EdgeTracker {
             self.inside.unwrap_or(position)
         };
         if !self.armed {
-            if layout.distance_from_edge(edge, position) >= REARM_PX {
+            let point = layout.clamp_from(position, from);
+            if self
+                .crossing
+                .is_some_and(|hit| !hit.contains(edge, layout, point))
+                || layout.distance_from_edge(edge, point) >= REARM_PX
+            {
                 self.armed = true;
+                self.crossing = None;
             }
             return None;
         }
@@ -200,10 +245,11 @@ impl EdgeTracker {
             FlowEdge::Left | FlowEdge::Right => y,
             FlowEdge::Top | FlowEdge::Bottom => x,
         };
-        let cornered = edge
-            .perpendicular()
-            .into_iter()
-            .any(|side| layout.outer_edge_overshoot_from(side, position, from).is_some());
+        let cornered = edge.perpendicular().into_iter().any(|side| {
+            layout
+                .outer_edge_overshoot_from(side, position, from)
+                .is_some()
+        });
         let push = overshoot > 0
             || (!cornered
                 && (self.since.is_none() || previous.is_none_or(|p| along(p) == along(position))));
@@ -221,7 +267,14 @@ impl EdgeTracker {
         let needed = if delay.is_zero() { 1 } else { 2 };
         if push && now.saturating_duration_since(start) >= delay && self.pushes >= needed {
             self.disarm_until_leave();
-            Some(layout.entry(edge, position))
+            let entry = layout.entry(edge, position);
+            let point = layout.clamp_from(position, from);
+            self.crossing = Some(Crossing {
+                at: now,
+                entry,
+                display: *layout.monitor_for(point),
+            });
+            Some(entry)
         } else {
             None
         }
@@ -424,8 +477,15 @@ pub enum Captured {
     EdgeHit {
         peer: String,
         entry: f64,
+        generation: u64,
+        at: Instant,
     },
+    CaptureStarted,
     Event(InputEvent),
+    Forwarded {
+        session: Uuid,
+        event: InputEvent,
+    },
     Move {
         dx: i32,
         dy: i32,
@@ -433,12 +493,19 @@ pub enum Captured {
     Emergency,
     Returned {
         peer: String,
+        session: Uuid,
         entry: f64,
+    },
+    CaptureStale {
+        session: Option<Uuid>,
     },
     HookReinstalled {
         removed: bool,
+        session: Option<Uuid>,
     },
-    HookFailed,
+    HookFailed {
+        session: Option<Uuid>,
+    },
     Link {
         peer: String,
         result: Result<(), String>,
@@ -454,6 +521,8 @@ pub struct Arm {
 #[derive(Default)]
 pub struct CaptureLogic {
     pub arms: Vec<Arm>,
+    session: Option<Uuid>,
+    generation: u64,
     anchor: (i32, i32),
     buttons: ButtonTracker,
     keys: KeyTracker,
@@ -461,6 +530,48 @@ pub struct CaptureLogic {
     pub swap_command_control: bool,
 }
 impl CaptureLogic {
+    fn pending_crossing(&self, peer: &str, at: Instant) -> Option<(&Arm, Crossing)> {
+        let arm = self.arms.iter().find(|arm| arm.peer == peer)?;
+        let hit = arm.tracker.crossing.filter(|hit| hit.at == at)?;
+        Some((arm, hit))
+    }
+    fn still_at_crossing(
+        &self,
+        peer: &str,
+        at: Instant,
+        layout: &Layout,
+        cursor: Option<(i32, i32)>,
+    ) -> bool {
+        self.pending_crossing(peer, at).is_some_and(|(arm, hit)| {
+            cursor.is_none_or(|point| {
+                hit.contains(arm.tracker.config.edge, layout, layout.clamp(point))
+            })
+        })
+    }
+    fn after_retreat(&mut self, peer: &str, at: Instant) -> Option<Captured> {
+        if let Some(arm) = self
+            .arms
+            .iter_mut()
+            .find(|arm| arm.peer == peer && arm.tracker.crossing.is_some_and(|hit| hit.at == at))
+        {
+            // The native cursor moved ahead of the last hook sample.
+            arm.tracker.crossing = None;
+            arm.tracker.armed = true;
+        }
+        // A second physical crossing occurred while the first request was
+        // pending. Retry its own entry once the first receiver is released.
+        let (arm, hit) = self
+            .arms
+            .iter()
+            .filter_map(|arm| Some((arm, arm.tracker.crossing.filter(|hit| hit.at > at)?)))
+            .max_by_key(|(_, hit)| hit.at)?;
+        Some(Captured::EdgeHit {
+            peer: arm.peer.clone(),
+            entry: hit.entry,
+            generation: self.generation,
+            at: hit.at,
+        })
+    }
     fn ctrl(&self) -> bool {
         self.keys.held(0x1D) || self.keys.held(0x11D)
     }
@@ -493,6 +604,7 @@ impl CaptureLogic {
         })
     }
     pub fn set_arm(&mut self, peer: &str, config: FlowConfig) {
+        self.generation = self.generation.wrapping_add(1);
         self.arms.retain(|a| a.peer != peer);
         self.arms.push(Arm {
             peer: peer.into(),
@@ -500,20 +612,30 @@ impl CaptureLogic {
         });
     }
     pub fn remove_arm(&mut self, peer: &str) {
+        self.generation = self.generation.wrapping_add(1);
         self.arms.retain(|a| a.peer != peer);
     }
     pub fn disarm_until_leave(&mut self, peer: &str) {
+        self.generation = self.generation.wrapping_add(1);
         if let Some(arm) = self.arms.iter_mut().find(|a| a.peer == peer) {
             arm.tracker.disarm_until_leave();
         }
     }
+    fn rearm_after_return(&mut self, peer: &str, point: (i32, i32)) {
+        self.generation = self.generation.wrapping_add(1);
+        if let Some(arm) = self.arms.iter_mut().find(|a| a.peer == peer) {
+            arm.tracker.rearm_after_return(point);
+        }
+    }
     pub fn start_forwarding(&mut self, anchor: (i32, i32)) {
+        self.generation = self.generation.wrapping_add(1);
         self.anchor = anchor;
         self.keys.begin();
         self.buttons.begin();
         self.wheel = (0, 0);
     }
     pub fn end_forwarding(&mut self, peer: &str) -> Vec<InputEvent> {
+        self.session = None;
         let buttons = self.buttons.finish();
         let keys = self.keys.finish();
         let mut releases: Vec<InputEvent> = buttons
@@ -622,21 +744,26 @@ impl CaptureLogic {
                     return (Verdict::Swallow, event);
                 }
                 let (buttons, ctrl) = (self.buttons.any_held(), self.ctrl());
+                let mut captured = None;
                 for arm in &mut self.arms {
+                    // A pending visit must still observe a retreat when a
+                    // different arm claims the same physical sample.
+                    if captured.is_some() && arm.tracker.crossing.is_none() {
+                        continue;
+                    }
                     if let Some(entry) =
                         arm.tracker
                             .update_layout((x, y), from, layout, buttons, ctrl, now)
                     {
-                        return (
-                            Verdict::Pass,
-                            Some(Captured::EdgeHit {
-                                peer: arm.peer.clone(),
-                                entry,
-                            }),
-                        );
+                        captured = Some(Captured::EdgeHit {
+                            peer: arm.peer.clone(),
+                            entry,
+                            generation: self.generation,
+                            at: now,
+                        });
                     }
                 }
-                (Verdict::Pass, None)
+                (Verdict::Pass, captured)
             }
         }
     }
@@ -682,10 +809,19 @@ pub struct FlowState {
     pub peers: HashMap<String, FlowConfig>,
     pub switch: Switch,
     pub last_error: Option<FlowError>,
+    last_handoff: Option<FlowTiming>,
+    active: Option<Visit>,
+    transitions: Arc<tokio::sync::Mutex<()>>,
     links: HashMap<String, link::Reconnect>,
     suspended: HashSet<String>,
     remote_closed: HashSet<String>,
     controller: Option<Controller>,
+}
+struct Visit {
+    token: Uuid,
+    edge: FlowEdge,
+    link: Arc<Session>,
+    started_at: Instant,
 }
 impl FlowState {
     pub fn connecting(&self) -> Option<&str> {
@@ -694,8 +830,56 @@ impl FlowState {
     pub fn forwarding(&self) -> Option<&str> {
         self.switch.forwarding()
     }
+    pub fn switch_id(&self) -> Option<Uuid> {
+        self.active.as_ref().map(|visit| visit.token)
+    }
+    fn matches_session(&self, peer: &str, session: Uuid) -> bool {
+        self.switch.peer() == Some(peer) && self.switch_id() == Some(session)
+    }
+    pub(super) fn begin_switch(
+        &mut self,
+        peer: &str,
+        edge: FlowEdge,
+        now: Instant,
+        link: Arc<Session>,
+    ) -> Option<Uuid> {
+        if !self.switch.apply(SwitchEvent::Begin {
+            peer: peer.into(),
+            now,
+        }) {
+            return None;
+        }
+        let session = Uuid::new_v4();
+        self.active = Some(Visit {
+            token: session,
+            edge,
+            link,
+            started_at: now,
+        });
+        Some(session)
+    }
+    fn confirm_switch(&mut self, peer: &str, token: Uuid, at: Instant) -> bool {
+        let Some(visit) = self.active.as_ref().filter(|visit| visit.token == token) else {
+            return false;
+        };
+        if !self.switch.apply(SwitchEvent::Started {
+            peer: peer.into(),
+            ok: true,
+        }) {
+            return false;
+        }
+        self.last_handoff = Some(FlowTiming {
+            peer: peer.into(),
+            elapsed_ms: at.saturating_duration_since(visit.started_at).as_millis() as u64,
+        });
+        true
+    }
+    fn controller_is(&self, id: Uuid) -> bool {
+        self.controller.as_ref().is_some_and(|c| c.id == id)
+    }
 }
 struct Controller {
+    id: Uuid,
     tx: UnboundedSender<Captured>,
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     hook: platform::HookThread,
@@ -709,7 +893,8 @@ fn shutdown(flow: &mut FlowState) {
         controller.hook.stop();
     }
     flow.peers.clear();
-    flow.switch = Switch::Local;
+    flow.switch.apply(SwitchEvent::Emergency);
+    flow.active = None;
     flow.links.clear();
     flow.suspended.clear();
     flow.remote_closed.clear();
@@ -735,16 +920,53 @@ pub fn session_ended(flow: &mut FlowState, peer: &str) {
         local_end(flow, peer);
     }
 }
-fn local_end(flow: &mut FlowState, peer: &str) -> Vec<InputEvent> {
-    platform::set_forwarding(false);
-    let releases = platform::with_logic(|logic| logic.end_forwarding(peer)).unwrap_or_default();
-    flow.switch.apply(SwitchEvent::Lost { peer: peer.into() });
-    releases
+fn local_end(flow: &mut FlowState, peer: &str) -> Option<(Visit, Vec<InputEvent>)> {
+    finish_switch(flow, peer, SwitchEvent::Lost { peer: peer.into() })
 }
-fn release_remote(core: &Core, peer: &str, releases: Vec<InputEvent>) {
-    for event in releases {
-        crate::network::try_send(core, peer, Wire::Input { event });
+fn finish_switch(
+    flow: &mut FlowState,
+    peer: &str,
+    reason: SwitchEvent,
+) -> Option<(Visit, Vec<InputEvent>)> {
+    if flow.switch.peer() != Some(peer) || !flow.switch.apply(reason) {
+        return None;
     }
+    platform::set_forwarding(false);
+    let releases = platform::with_logic(|logic| {
+        platform::take_moves();
+        logic.end_forwarding(peer)
+    })
+    .unwrap_or_default();
+    Some((flow.active.take()?, releases))
+}
+async fn release_remote(core: &Core, peer: &str, visit: Visit, releases: Vec<InputEvent>) {
+    for event in releases {
+        if crate::network::send_flow_on(
+            core,
+            peer,
+            &visit.link,
+            visit.token,
+            FlowPacket::Input { event },
+        )
+        .await
+        .is_err()
+        {
+            break;
+        }
+    }
+    let _ =
+        crate::network::send_flow_on(core, peer, &visit.link, visit.token, FlowPacket::Stop).await;
+}
+
+pub(super) async fn transition(core: &Core) -> Result<tokio::sync::OwnedMutexGuard<()>, String> {
+    let transitions = core
+        .input
+        .lock()
+        .map_err(|_| "Input lock unavailable.")?
+        .flow
+        .transitions
+        .clone();
+    Ok(transitions.lock_owned().await)
 }
 
 pub fn remote_closed(core: &Core, peer: &str) {
@@ -774,19 +996,46 @@ pub fn user_disconnected(core: &Core, peer: &str) {
     }
 }
 
-pub fn returned(core: &Core, peer: &str, entry: f64) -> Result<(), String> {
+pub fn returned(
+    core: &Core,
+    peer: &str,
+    session: Option<Uuid>,
+    entry: f64,
+) -> Result<bool, String> {
     validate_entry(entry)?;
-    let state = core.input.lock().map_err(|_| "Input lock unavailable.")?;
-    if state.flow.forwarding() != Some(peer) {
-        return Ok(());
+    let mut state = core.input.lock().map_err(|_| "Input lock unavailable.")?;
+    let Some(visit) = state.flow.active.as_ref() else {
+        return Ok(false);
+    };
+    let (active, edge) = (visit.token, visit.edge);
+    let expected = (visit.link.protocol >= link::SCOPED_FLOW).then_some(active);
+    if state.flow.forwarding() != Some(peer) || session != expected {
+        return Ok(false);
     }
+    if session.is_some() {
+        // Restore control on receipt. Captured input may still be in the
+        // controller queue, but its token can no longer touch this visit.
+        finish_switch(
+            &mut state.flow,
+            peer,
+            SwitchEvent::Returned { peer: peer.into() },
+        );
+        state.sending_to = None;
+        platform::place_cursor(peer, edge, entry);
+        // The reader sends Stop directly on this connection. Receiver
+        // teardown releases every injected key and button in that visit.
+        return Ok(true);
+    }
+    // Older peers only recognize untagged input. Let the controller put
+    // their stop behind the already queued input and ahead of another start.
     if let Some(controller) = &state.flow.controller {
         let _ = controller.tx.send(Captured::Returned {
             peer: peer.into(),
+            session: active,
             entry,
         });
     }
-    Ok(())
+    Ok(false)
 }
 
 fn ticker(period: Duration) -> tokio::time::Interval {
@@ -795,125 +1044,231 @@ fn ticker(period: Duration) -> tokio::time::Interval {
     interval
 }
 
-async fn controller(core: Arc<Core>, mut rx: UnboundedReceiver<Captured>) {
+async fn controller(core: Arc<Core>, id: Uuid, mut rx: UnboundedReceiver<Captured>) {
     let mut flush = ticker(Duration::from_millis(4));
     let mut keepalive = ticker(Duration::from_secs(1));
     let mut health = ticker(Duration::from_millis(250));
     let mut supervisor = Supervisor::new(&core);
     loop {
+        let active = {
+            let Ok(state) = core.input.lock() else {
+                break;
+            };
+            if !state.flow.controller_is(id) {
+                break;
+            }
+            state
+                .flow
+                .forwarding()
+                .and_then(|peer| state.flow.switch_id().map(|token| (peer.to_owned(), token)))
+        };
         tokio::select! {
-            message = rx.recv() => match message {
-                None | Some(Captured::Shutdown) => break,
-                Some(Captured::EdgeHit { peer, entry }) => {
-                    platform::take_moves();
-                    tokio::spawn(begin(core.clone(), peer, entry));
-                }
-                Some(Captured::Move { .. }) => {}
-                Some(Captured::Event(event)) => {
-                    if let Some(peer) = forwarding(&core) {
-                        flush_moves(&core, &peer).await;
-                        if let Err(error) = send(&core, &peer, Wire::Input { event }).await {
-                            end(&core, &peer, None, Some(FlowError::new("connection_lost", &peer, error))).await;
-                        }
-                    }
-                }
-                Some(Captured::Emergency) => {
-                    platform::set_forwarding(false);
-                    if let Ok(mut state) = core.input.lock() {
-                        state.flow.switch.apply(SwitchEvent::Emergency);
-                    }
-                    crate::emergency_stop_core(&core);
+            message = rx.recv() => {
+                let Some(message) = message else { break; };
+                if !controller_is_current(&core, id) || !handle_capture(&core, id, &supervisor, message).await {
                     break;
                 }
-                Some(Captured::Returned { peer, entry }) => {
-                    if forwarding(&core).as_deref() == Some(peer.as_str()) {
-                        platform::take_moves();
-                        end(&core, &peer, Some(entry), None).await;
-                    }
-                }
-                Some(Captured::HookReinstalled { removed }) => {
-                    if removed {
-                        if let Some(peer) = forwarding(&core) {
-                            end(&core, &peer, None, Some(FlowError::new(
-                                "hook_removed",
-                                &peer,
-                                platform::REMOVED_DETAIL,
-                            ))).await;
-                        }
-                    }
-                }
-                Some(Captured::HookFailed) => {
-                    let detail = "The low-level input hooks could not be reinstalled.";
-                    if let Some(peer) = forwarding(&core) {
-                        end(&core, &peer, None, Some(FlowError::new("hook_failed", &peer, detail))).await;
-                    }
-                    if let Ok(mut state) = core.input.lock() {
-                        state.flow.last_error = Some(FlowError {
-                            code: "hook_failed",
-                            peer: None,
-                            detail: detail.into(),
-                        });
-                    }
-                }
-                Some(Captured::Link { peer, result }) => supervisor.link_result(&core, &peer, result),
             },
-            _ = flush.tick() => {
-                platform::heartbeat();
-                match forwarding(&core) {
-                    Some(peer) => flush_moves(&core, &peer).await,
-                    None => {
-                        platform::take_moves();
-                    }
+            _ = flush.tick(), if active.is_some() => {
+                if let Some((peer, session)) = active {
+                    flush_moves(&core, &peer, session).await;
                 }
             }
             _ = keepalive.tick() => {
-                if let Some(peer) = forwarding(&core) {
-                    if let Err(error) = send(&core, &peer, Wire::InputKeepalive).await {
-                        end(&core, &peer, None, Some(FlowError::new("connection_lost", &peer, error))).await;
+                if let Some((peer, session)) = forwarding(&core, id) {
+                    if let Err(error) = send(&core, &peer, session, FlowPacket::Keepalive).await {
+                        end(&core, &peer, session, None, Some(FlowError::new("connection_lost", &peer, error))).await;
                     }
                 }
             }
             _ = health.tick() => {
-                if !supervisor.check(&core) { break; }
+                if !supervisor.check(&core, id) { break; }
             }
         }
     }
-    platform::set_forwarding(false);
 }
 
-fn forwarding(core: &Core) -> Option<String> {
+async fn handle_capture(
+    core: &Arc<Core>,
+    id: Uuid,
+    supervisor: &Supervisor,
+    message: Captured,
+) -> bool {
+    match message {
+        Captured::Shutdown => return false,
+        Captured::EdgeHit {
+            peer,
+            entry,
+            generation,
+            at,
+        } => begin(core, id, peer, entry, generation, at),
+        Captured::CaptureStarted | Captured::Move { .. } | Captured::Event(_) => {}
+        Captured::Forwarded { session, event } => {
+            if let Some((peer, _)) = forwarding(core, id).filter(|(_, token)| *token == session) {
+                if flush_moves(core, &peer, session).await {
+                    if let Err(error) =
+                        send(core, &peer, session, FlowPacket::Input { event }).await
+                    {
+                        end(
+                            core,
+                            &peer,
+                            session,
+                            None,
+                            Some(FlowError::new("connection_lost", &peer, error)),
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+        Captured::Emergency => {
+            crate::emergency_stop_core(core);
+            return false;
+        }
+        Captured::Returned {
+            peer,
+            session,
+            entry,
+        } => end(core, &peer, session, Some(entry), None).await,
+        Captured::CaptureStale { session } => {
+            if let Some((peer, token)) =
+                forwarding(core, id).filter(|(_, token)| Some(*token) == session)
+            {
+                end(
+                    core,
+                    &peer,
+                    token,
+                    None,
+                    Some(FlowError::new(
+                        "hook_stale",
+                        &peer,
+                        "Input capture stopped responding. Local control was restored.",
+                    )),
+                )
+                .await;
+            }
+        }
+        Captured::HookReinstalled {
+            removed: true,
+            session,
+        } => {
+            if let Some((peer, token)) =
+                forwarding(core, id).filter(|(_, token)| Some(*token) == session)
+            {
+                end(
+                    core,
+                    &peer,
+                    token,
+                    None,
+                    Some(FlowError::new(
+                        "hook_removed",
+                        &peer,
+                        platform::REMOVED_DETAIL,
+                    )),
+                )
+                .await;
+            }
+        }
+        Captured::HookReinstalled { removed: false, .. } => {}
+        Captured::HookFailed { session } => {
+            let detail = "The low-level input hooks could not be reinstalled.";
+            if let Some((peer, token)) =
+                forwarding(core, id).filter(|(_, token)| Some(*token) == session)
+            {
+                end(
+                    core,
+                    &peer,
+                    token,
+                    None,
+                    Some(FlowError::new("hook_failed", &peer, detail)),
+                )
+                .await;
+            } else if let Ok(mut state) = core.input.lock() {
+                if state.flow.controller_is(id)
+                    && state.flow.switch_id().is_none()
+                    && platform::capture_status().is_some_and(|capture| !capture.installed)
+                {
+                    state.flow.last_error = Some(FlowError {
+                        code: "hook_failed",
+                        peer: None,
+                        detail: detail.into(),
+                    });
+                }
+            }
+        }
+        Captured::Link { peer, result } => {
+            record_link(core, id, &peer, result, &supervisor.backoff)
+        }
+    }
+    true
+}
+
+fn controller_is_current(core: &Core, id: Uuid) -> bool {
+    core.input.lock().is_ok_and(|s| s.flow.controller_is(id))
+}
+
+fn forwarding(core: &Core, controller: Uuid) -> Option<(String, Uuid)> {
     core.input
         .lock()
         .ok()
-        .and_then(|s| s.flow.forwarding().map(str::to_owned))
+        .filter(|s| s.flow.controller_is(controller))
+        .and_then(|s| Some((s.flow.forwarding()?.to_owned(), s.flow.switch_id()?)))
 }
 
-async fn send(core: &Core, peer: &str, message: Wire) -> Result<(), String> {
-    crate::network::send_message(core, peer, message).await
+async fn send(core: &Core, peer: &str, session: Uuid, message: FlowPacket) -> Result<(), String> {
+    let link = core.input.lock().ok().and_then(|state| {
+        state
+            .flow
+            .active
+            .as_ref()
+            .filter(|visit| visit.token == session)
+            .map(|visit| visit.link.clone())
+    });
+    let Some(link) = link else {
+        return Ok(());
+    };
+    crate::network::send_flow_on(core, peer, &link, session, message).await
 }
 
-async fn flush_moves(core: &Core, peer: &str) {
-    let mut pending = platform::take_moves();
+async fn flush_moves(core: &Core, peer: &str, session: Uuid) -> bool {
+    let mut pending = {
+        let Ok(state) = core.input.lock() else {
+            return false;
+        };
+        if state.flow.forwarding() != Some(peer) || state.flow.switch_id() != Some(session) {
+            return false;
+        }
+        platform::heartbeat();
+        platform::take_moves()
+    };
     while pending != (0, 0) {
         let dx = pending.0.clamp(-MAX_DELTA, MAX_DELTA);
         let dy = pending.1.clamp(-MAX_DELTA, MAX_DELTA);
         pending.0 -= dx;
         pending.1 -= dy;
-        let message = Wire::Input {
+        let message = FlowPacket::Input {
             event: InputEvent::MoveBy { dx, dy },
         };
-        if let Err(error) = send(core, peer, message).await {
-            platform::take_moves();
+        if let Err(error) = send(core, peer, session, message).await {
             end(
                 core,
                 peer,
+                session,
                 None,
                 Some(FlowError::new("connection_lost", peer, error)),
             )
             .await;
-            return;
+            return false;
+        }
+        if !core
+            .input
+            .lock()
+            .is_ok_and(|s| s.flow.matches_session(peer, session))
+        {
+            return false;
         }
     }
+    true
 }
 
 struct PeerProbe {
@@ -941,7 +1296,7 @@ impl Supervisor {
         }
     }
 
-    fn check(&mut self, core: &Arc<Core>) -> bool {
+    fn check(&mut self, core: &Arc<Core>, controller: Uuid) -> bool {
         let now = Instant::now();
         let wall = SystemTime::now();
         let resumed = link::resumed(
@@ -960,7 +1315,7 @@ impl Supervisor {
             self.addresses_at = now;
         }
         let peers: Vec<String> = match core.input.lock() {
-            Ok(state) if state.flow.controller.is_some() => {
+            Ok(state) if state.flow.controller_is(controller) => {
                 state.flow.peers.keys().cloned().collect()
             }
             _ => return false,
@@ -984,8 +1339,12 @@ impl Supervisor {
             return false;
         };
         let state = &mut *guard;
+        if !state.flow.controller_is(controller) {
+            return false;
+        }
         let starting = state.flow.connecting().map(str::to_owned);
         if state.flow.switch.apply(SwitchEvent::Tick { now }) {
+            state.flow.active = None;
             if let Some(peer) = starting {
                 if state.sending_to.as_deref() == Some(peer.as_str()) {
                     state.sending_to = None;
@@ -1085,20 +1444,28 @@ impl Supervisor {
         }
         true
     }
-
-    fn link_result(&self, core: &Core, peer: &str, result: Result<(), String>) {
-        record_link(core, peer, result, &self.backoff);
-    }
 }
 
-fn record_link(core: &Core, peer: &str, result: Result<(), String>, backoff: &link::Backoff) {
+fn record_link(
+    core: &Core,
+    controller: Uuid,
+    peer: &str,
+    result: Result<(), String>,
+    backoff: &link::Backoff,
+) {
     let Ok(mut state) = core.input.lock() else {
         return;
     };
     let flow = &mut state.flow;
+    if !flow.controller_is(controller) {
+        return;
+    }
     let Some(link) = flow.links.get_mut(peer) else {
         return;
     };
+    if !link.in_flight {
+        return;
+    }
     match result {
         Ok(()) => link.connected(),
         Err(error) => {
@@ -1123,85 +1490,157 @@ async fn reconnect(core: &Arc<Core>, peer: &str, address: String) -> Result<(), 
     .map(|_| ())
 }
 
-async fn begin(core: Arc<Core>, peer: String, entry: f64) {
-    let peer = peer.as_str();
-    let config = {
-        let Ok(state) = core.input.lock() else {
-            return;
-        };
-        let Some(config) = state.flow.peers.get(peer).copied() else {
-            return;
-        };
-        if state.busy() || state.flow.switch != Switch::Local {
-            return;
-        }
-        config
+fn begin(
+    core: &Arc<Core>,
+    controller: Uuid,
+    peer: String,
+    entry: f64,
+    generation: u64,
+    at: Instant,
+) {
+    let link = crate::network::session(core, &peer);
+    // Lock in the same order as input reservations. Revocation will either
+    // precede this permission check or observe the new visit and release it.
+    let Ok(data) = core.data.lock() else {
+        return;
     };
-    if let Err(error) = crate::input::enabled(&core, peer) {
-        set_error(
-            &core,
-            peer,
-            FlowError::new("permission_changed", peer, error),
-        );
+    let Ok(mut state) = core.input.lock() else {
+        return;
+    };
+    let permitted = crate::input::check_permission(&data, &peer);
+    drop(data);
+    if state.busy()
+        || !state.flow.controller_is(controller)
+        || platform::with_logic(|logic| {
+            logic.generation == generation && logic.pending_crossing(&peer, at).is_some()
+        }) != Some(true)
+    {
         return;
     }
-    {
-        let Ok(mut state) = core.input.lock() else {
-            return;
-        };
-        if state.busy()
-            || !state.flow.peers.contains_key(peer)
-            || !state.flow.switch.apply(SwitchEvent::Begin {
-                peer: peer.into(),
-                now: Instant::now(),
-            })
-        {
+    let Some(config) = state.flow.peers.get(&peer).copied() else {
+        return;
+    };
+    if let Err(error) = permitted {
+        state.flow.last_error = Some(FlowError::new("permission_changed", &peer, error));
+        return;
+    }
+    let link = match link {
+        Ok(link) => link,
+        Err(error) => {
+            state.flow.last_error = Some(FlowError::new("connection_lost", &peer, error));
             return;
         }
-        state.sending_to = Some(peer.into());
-    }
+    };
+    let Some(session) = state.flow.begin_switch(&peer, config.edge, at, link) else {
+        return;
+    };
+    state.sending_to = Some(peer.clone());
+    tokio::spawn(complete_start(
+        core.clone(),
+        controller,
+        peer,
+        session,
+        config,
+        entry,
+        platform::begin_forwarding,
+    ));
+}
+
+async fn complete_start(
+    core: Arc<Core>,
+    controller: Uuid,
+    peer: String,
+    session: Uuid,
+    config: FlowConfig,
+    entry: f64,
+    activate: impl FnOnce(Uuid, &str, Instant) -> Result<bool, String>,
+) {
+    let peer = peer.as_str();
+    // Put a retry behind the previous visit's stop on legacy connections.
+    let Ok(_transition) = transition(&core).await else {
+        return;
+    };
+    let Some((link, at)) = core.input.lock().ok().and_then(|state| {
+        if !state.flow.controller_is(controller) || !state.flow.matches_session(peer, session) {
+            return None;
+        }
+        state
+            .flow
+            .active
+            .as_ref()
+            .map(|visit| (visit.link.clone(), visit.started_at))
+    }) else {
+        return;
+    };
     let result = tokio::time::timeout(
         Duration::from_secs(3),
-        crate::network::flow_start(&core, peer, config.edge, entry, config.clipboard),
+        crate::network::flow_start_on(&link, session, config.edge, entry, config.clipboard),
     )
     .await
     .unwrap_or_else(|_| Err("timeout: the other computer did not confirm Flow.".into()))
     .map_err(|error| FlowError::new(classify_start_error(&error), peer, error));
+    let receiver_may_have_started =
+        result.is_ok() || result.as_ref().is_err_and(|e| e.code == "timeout");
     let started = {
-        let Ok(mut guard) = core.input.lock() else {
+        let Ok(mut state) = core.input.lock() else {
             return;
         };
-        let state = &mut *guard;
-        let ok = result.is_ok()
-            && state.sending_to.as_deref() == Some(peer)
-            && state.flow.peers.contains_key(peer)
-            && state.flow.controller.is_some()
-            && state.flow.connecting() == Some(peer);
-        state.flow.switch.apply(SwitchEvent::Started {
-            peer: peer.into(),
-            ok,
-        });
-        if ok {
-            state.flow.last_error = None;
-            platform::begin_forwarding();
+        if !state.flow.matches_session(peer, session) || !state.flow.controller_is(controller) {
+            false
         } else {
-            if state.sending_to.as_deref() == Some(peer) && state.flow.switch.peer() != Some(peer) {
-                state.sending_to = None;
+            let result = result.and_then(|()| {
+                if state.sending_to.as_deref() != Some(peer)
+                    || state.flow.peers.get(peer) != Some(&config)
+                    || state.flow.connecting() != Some(peer)
+                {
+                    return Err(FlowError::new(
+                        "start_failed",
+                        peer,
+                        "Flow changed while the other computer was confirming.",
+                    ));
+                }
+                activate(session, peer, at)
+                    .map_err(|error| FlowError::new("hook_failed", peer, error))
+            });
+            let ok = matches!(result, Ok(true));
+            if ok {
+                state.flow.confirm_switch(peer, session, Instant::now());
+                if let Some(controller) = &state.flow.controller {
+                    // The movement timer sleeps while local. Wake it as soon
+                    // as capture takes ownership, including when input is idle.
+                    let _ = controller.tx.send(Captured::CaptureStarted);
+                }
+            } else {
+                state.flow.switch.apply(SwitchEvent::Started {
+                    peer: peer.into(),
+                    ok: false,
+                });
+                state.flow.active = None;
+                if state.sending_to.as_deref() == Some(peer) {
+                    state.sending_to = None;
+                }
+                if matches!(result, Ok(false)) {
+                    if let Some(retry) =
+                        platform::with_logic(|logic| logic.after_retreat(peer, at)).flatten()
+                    {
+                        if let Some(controller) = &state.flow.controller {
+                            let _ = controller.tx.send(retry);
+                        }
+                    }
+                } else {
+                    platform::with_logic(|logic| logic.disarm_until_leave(peer));
+                }
             }
-            platform::with_logic(|logic| logic.disarm_until_leave(peer));
-            state.flow.last_error = Some(result.clone().err().unwrap_or_else(|| {
-                FlowError::new(
-                    "start_failed",
-                    peer,
-                    "Flow was interrupted during the start.",
-                )
-            }));
+            state.flow.last_error = result.err();
+            ok
         }
-        ok
     };
     if !started {
-        if result.is_ok() {
-            let _ = send(&core, peer, Wire::ControlStop).await;
+        // A missing acknowledgement can leave a receiver active. A negative
+        // acknowledgement, such as a busy legacy peer, did not start a visit.
+        if receiver_may_have_started {
+            let _ =
+                crate::network::send_flow_on(&core, peer, &link, session, FlowPacket::Stop).await;
         }
         return;
     }
@@ -1213,45 +1652,38 @@ async fn begin(core: Arc<Core>, peer: String, entry: f64) {
     }
 }
 
-async fn end(core: &Core, peer: &str, entry: Option<f64>, error: Option<FlowError>) {
-    let (edge, releases) = {
+async fn end(core: &Core, peer: &str, session: Uuid, entry: Option<f64>, error: Option<FlowError>) {
+    let Ok(_transition) = transition(core).await else {
+        return;
+    };
+    let (visit, releases) = {
         let Ok(mut state) = core.input.lock() else {
-            platform::set_forwarding(false);
             return;
         };
         let state = &mut *state;
-        let edge = state.flow.peers.get(peer).map(|c| c.edge);
+        if !state.flow.matches_session(peer, session) {
+            return;
+        }
         let reason = match (&entry, &error) {
             (Some(_), _) => SwitchEvent::Returned { peer: peer.into() },
-            (None, Some(e)) if e.code.starts_with("hook_") => SwitchEvent::HookLost,
+            (None, Some(error)) if error.code.starts_with("hook_") => SwitchEvent::HookLost,
             _ => SwitchEvent::Lost { peer: peer.into() },
         };
-        state.flow.switch.apply(reason);
-        let releases = local_end(&mut state.flow, peer);
+        let Some((visit, releases)) = finish_switch(&mut state.flow, peer, reason) else {
+            return;
+        };
         if state.sending_to.as_deref() == Some(peer) {
             state.sending_to = None;
         }
         if error.is_some() {
             state.flow.last_error = error;
         }
-        (edge, releases)
-    };
-    if let (Some(entry), Some(edge)) = (entry, edge) {
-        platform::place_cursor(edge, entry);
-    }
-    for event in releases {
-        if send(core, peer, Wire::Input { event }).await.is_err() {
-            break;
+        if let Some(entry) = entry {
+            platform::place_cursor(peer, visit.edge, entry);
         }
-    }
-    let _ = send(core, peer, Wire::ControlStop).await;
-}
-
-fn set_error(core: &Core, peer: &str, error: FlowError) {
-    if let Ok(mut state) = core.input.lock() {
-        state.flow.last_error = Some(error);
-    }
-    platform::with_logic(|logic| logic.disarm_until_leave(peer));
+        (visit, releases)
+    };
+    release_remote(core, peer, visit, releases).await;
 }
 
 #[derive(serde::Serialize)]
@@ -1290,9 +1722,17 @@ pub struct FlowStatus {
     pub connecting: Option<String>,
     pub forwarding: Option<String>,
     pub last_error: Option<FlowError>,
+    pub last_handoff: Option<FlowTiming>,
+    pub last_return: Option<FlowTiming>,
     pub links: HashMap<String, FlowLinkStatus>,
     pub capture: Option<CaptureStatus>,
     pub saved: HashMap<String, FlowPeerStatus>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FlowTiming {
+    pub(crate) peer: String,
+    pub(crate) elapsed_ms: u64,
 }
 pub fn status(core: &Core) -> FlowStatus {
     let saved: HashMap<String, FlowPeerStatus> = core
@@ -1363,6 +1803,8 @@ pub fn status(core: &Core) -> FlowStatus {
         connecting: flow.and_then(|f| f.connecting().map(str::to_owned)),
         forwarding: flow.and_then(|f| f.forwarding().map(str::to_owned)),
         last_error: flow.and_then(|f| f.last_error.clone()),
+        last_handoff: flow.and_then(|f| f.last_handoff.clone()),
+        last_return: state.as_ref().ok().and_then(|s| s.last_return.clone()),
         links: flow
             .map(|f| {
                 f.peers
@@ -1404,7 +1846,7 @@ pub fn status(core: &Core) -> FlowStatus {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn configure(
+pub async fn configure(
     core: &Arc<Core>,
     peer: &str,
     enabled: bool,
@@ -1415,17 +1857,23 @@ pub fn configure(
     clipboard: bool,
 ) -> Result<FlowStatus, String> {
     if !enabled {
-        {
+        let _transition = transition(core).await?;
+        let cleanup = {
             let mut guard = core.input.lock().map_err(|_| "Input lock unavailable.")?;
             let state = &mut *guard;
-            if state.flow.forwarding() == Some(peer) && state.sending_to.as_deref() == Some(peer) {
+            let cleanup = if state.flow.switch.peer() == Some(peer) {
+                let forwarding = state.flow.forwarding().is_some();
                 state.sending_to = None;
-                let releases = local_end(&mut state.flow, peer);
-                release_remote(core, peer, releases);
-                crate::network::try_send(core, peer, Wire::ControlStop);
-            }
+                local_end(&mut state.flow, peer).filter(|_| forwarding)
+            } else {
+                None
+            };
             disarm_peer(&mut state.flow, peer);
             state.flow.last_error = None;
+            cleanup
+        };
+        if let Some((visit, releases)) = cleanup {
+            release_remote(core, peer, visit, releases).await;
         }
         if let Err(error) = forget_saved(core, peer) {
             core.warning(error);
@@ -1464,15 +1912,17 @@ fn arm(core: &Arc<Core>, peer: &str, config: FlowConfig, restoring: bool) -> Res
         return Err("This edge is already assigned to another computer.".into());
     }
     if state.flow.controller.is_none() {
+        let id = Uuid::new_v4();
         let (tx, rx) = unbounded_channel();
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         let hook = platform::HookThread::start(tx.clone())?;
         state.flow.controller = Some(Controller {
+            id,
             tx,
             #[cfg(any(target_os = "windows", target_os = "macos"))]
             hook,
         });
-        tokio::spawn(controller(core.clone(), rx));
+        tokio::spawn(controller(core.clone(), id, rx));
     }
     state.flow.peers.insert(peer.into(), config);
     state.flow.links.remove(peer);
@@ -1570,25 +2020,32 @@ pub fn restore_saved(core: &Arc<Core>) {
 }
 
 pub async fn repair(core: &Arc<Core>, peer: &str) -> Result<FlowStatus, String> {
-    {
+    let transition = transition(core).await?;
+    let (controller, cleanup) = {
         let mut guard = core.input.lock().map_err(|_| "Input lock unavailable.")?;
         let state = &mut *guard;
         if !state.flow.peers.contains_key(peer) {
             return Err("Turn on Flow for this computer before repairing.".into());
         }
-        if state.flow.switch.peer() == Some(peer) {
+        if state
+            .flow
+            .links
+            .get(peer)
+            .is_some_and(|link| link.in_flight)
+        {
+            return Err("A reconnection attempt is already in progress.".into());
+        }
+        let cleanup = if state.flow.switch.peer() == Some(peer) {
+            let forwarding = state.flow.forwarding().is_some();
             if state.sending_to.as_deref() == Some(peer) {
                 state.sending_to = None;
             }
-            let releases = local_end(&mut state.flow, peer);
-            release_remote(core, peer, releases);
-            crate::network::try_send(core, peer, Wire::ControlStop);
-        }
+            local_end(&mut state.flow, peer).filter(|_| forwarding)
+        } else {
+            None
+        };
         let now = Instant::now();
         let link = state.flow.links.entry(peer.into()).or_default();
-        if link.in_flight {
-            return Err("A reconnection attempt is already in progress.".into());
-        }
         link.kick(now, Duration::ZERO);
         link.take_due(now);
         state.flow.remote_closed.remove(peer);
@@ -1600,18 +2057,39 @@ pub async fn repair(core: &Arc<Core>, peer: &str) -> Result<FlowStatus, String> 
         {
             state.flow.last_error = None;
         }
+        (
+            state
+                .flow
+                .controller
+                .as_ref()
+                .ok_or("Flow capture is unavailable.")?
+                .id,
+            cleanup,
+        )
+    };
+    if let Some((visit, releases)) = cleanup {
+        release_remote(core, peer, visit, releases).await;
     }
     platform::reinstall();
     let result = match crate::network::peer_address(core, peer) {
         Some(address) => {
             crate::network::drop_session(core, peer);
+            drop(transition);
             reconnect(core, peer, address).await
         }
         None => Err("No known address for this computer yet.".into()),
     };
-    record_link(core, peer, result.clone(), &link::Backoff::default());
+    record_link(
+        core,
+        controller,
+        peer,
+        result.clone(),
+        &link::Backoff::default(),
+    );
     if let Err(error) = result {
-        if let Ok(mut state) = core.input.lock() {
+        if let Some(mut state) = core.input.lock().ok().filter(|state| {
+            state.flow.controller_is(controller) && state.flow.peers.contains_key(peer)
+        }) {
             state.flow.last_error = Some(FlowError::new("reconnect_failed", peer, error));
         }
     }
@@ -1640,6 +2118,7 @@ pub async fn set_flow(
         block_while_button,
         clipboard.unwrap_or(false),
     )
+    .await
 }
 #[tauri::command]
 pub fn get_flow_status(state: tauri::State<'_, Arc<Core>>) -> FlowStatus {
@@ -1653,10 +2132,10 @@ pub async fn repair_flow(
     repair(state.inner(), &peer_id).await
 }
 
-#[cfg(target_os = "windows")]
-use win as platform;
 #[cfg(target_os = "macos")]
 use mac as platform;
+#[cfg(target_os = "windows")]
+use win as platform;
 #[cfg(target_os = "macos")]
 mod mac;
 #[cfg(target_os = "windows")]
@@ -1668,9 +2147,11 @@ mod platform {
     use super::{CaptureLogic, CaptureStatus, FlowEdge};
     pub const REMOVED_DETAIL: &str = "The input capture was removed.";
     pub fn set_forwarding(_: bool) {}
-    pub fn begin_forwarding() {}
+    pub fn begin_forwarding(_: uuid::Uuid, _: &str, _: std::time::Instant) -> Result<bool, String> {
+        Err(super::UNSUPPORTED.into())
+    }
     pub fn heartbeat() {}
-    pub fn place_cursor(_: FlowEdge, _: f64) {}
+    pub fn place_cursor(_: &str, _: FlowEdge, _: f64) {}
     pub fn with_logic<R>(_: impl FnOnce(&mut CaptureLogic) -> R) -> Option<R> {
         None
     }
@@ -1788,31 +2269,43 @@ mod win {
             .filter(|(_, vk)| unsafe { GetAsyncKeyState(*vk) } as u16 & 0x8000 != 0)
             .map(|(id, _)| id)
     }
-    pub fn begin_forwarding() {
-        take_moves();
-        let anchor = CTX.lock().ok().and_then(|mut guard| {
-            guard.as_mut().map(|ctx| {
-                let anchor = ctx.layout.monitor_for((0, 0)).center();
-                ctx.logic.start_forwarding(anchor);
-                ctx.logic.adopt_local_keys(modifiers_down());
-                anchor
-            })
-        });
-        let Some(anchor) = anchor else {
-            return;
+    pub fn begin_forwarding(session: uuid::Uuid, peer: &str, at: Instant) -> Result<bool, String> {
+        let unavailable = "Windows input capture is unavailable.";
+        let anchor = {
+            let guard = CTX.lock().map_err(|_| unavailable)?;
+            let ctx = guard.as_ref().filter(|_| installed()).ok_or(unavailable)?;
+            if !ctx
+                .logic
+                .still_at_crossing(peer, at, &ctx.layout, screen::win::cursor())
+            {
+                return Ok(false);
+            }
+            ctx.layout.monitor_for((0, 0)).center()
         };
+        // The hook must be able to service a cursor event during SetCursorPos.
+        if !screen::win::set_cursor(anchor) {
+            return Err("Windows could not reposition the local pointer for Flow.".into());
+        }
+        let mut guard = CTX.lock().map_err(|_| unavailable)?;
+        let ctx = guard.as_mut().filter(|_| installed()).ok_or(unavailable)?;
+        take_moves();
+        ctx.logic.start_forwarding(anchor);
+        ctx.logic.adopt_local_keys(modifiers_down());
+        ctx.logic.session = Some(session);
         heartbeat();
-        screen::win::set_cursor(anchor);
         set_forwarding(true);
+        Ok(true)
     }
-    pub fn place_cursor(edge: FlowEdge, entry: f64) {
+    pub fn place_cursor(peer: &str, edge: FlowEdge, entry: f64) {
         let point = CTX.lock().ok().and_then(|guard| {
             guard
                 .as_ref()
                 .map(|ctx| ctx.layout.entry_point(edge, entry, EDGE_INSET_PX))
         });
         if let Some(point) = point {
-            screen::win::set_cursor(point);
+            if screen::win::set_cursor(point) {
+                with_logic(|logic| logic.rearm_after_return(peer, point));
+            }
         }
     }
     pub fn reinstall() {
@@ -1840,19 +2333,16 @@ mod win {
 
     fn handle(event: RawEvent, injected: bool) -> bool {
         EVENTS.fetch_add(1, Ordering::Relaxed);
-        let mut forwarding = FORWARDING.load(Ordering::SeqCst);
-        if forwarding
-            && now_ms().saturating_sub(HEARTBEAT.load(Ordering::Relaxed)) > STALE.as_millis() as u64
-        {
-            set_forwarding(false);
-            forwarding = false;
-        }
         let Ok(mut guard) = CTX.lock() else {
             return false;
         };
-        let Some(HookCtx { logic, tx, layout }) = guard.as_mut() else {
+        let Some(ctx) = guard.as_mut() else {
             return false;
         };
+        // Read the mode after acquiring the context. A return can change it
+        // while a callback is waiting for begin/end_forwarding's context lock.
+        let forwarding = release_stale_capture(ctx);
+        let HookCtx { logic, tx, layout } = ctx;
         let (verdict, output) = logic.handle(event, injected, forwarding, layout, Instant::now());
         match output {
             Some(Captured::Move { dx, dy }) => {
@@ -1863,12 +2353,31 @@ mod win {
                 set_forwarding(false);
                 let _ = tx.send(Captured::Emergency);
             }
+            Some(Captured::Event(event)) => {
+                if let Some(session) = logic.session {
+                    let _ = tx.send(Captured::Forwarded { session, event });
+                }
+            }
             Some(other) => {
                 let _ = tx.send(other);
             }
             None => {}
         }
         verdict == Verdict::Swallow
+    }
+
+    fn release_stale_capture(ctx: &HookCtx) -> bool {
+        let forwarding = FORWARDING.load(Ordering::SeqCst);
+        if forwarding
+            && now_ms().saturating_sub(HEARTBEAT.load(Ordering::Relaxed)) > STALE.as_millis() as u64
+        {
+            set_forwarding(false);
+            let _ = ctx.tx.send(Captured::CaptureStale {
+                session: ctx.logic.session,
+            });
+            return false;
+        }
+        forwarding
     }
 
     unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -1987,6 +2496,15 @@ mod win {
         UnhookWindowsHookEx(hooks.keyboard);
     }
     unsafe fn reinstall_hooks(hooks: &mut Option<Hooks>, reason: u8) {
+        let removed = reason == REASON_REMOVED;
+        INSTALLED.store(false, Ordering::SeqCst);
+        let session = with_logic(|logic| {
+            if removed {
+                set_forwarding(false);
+            }
+            logic.session
+        })
+        .flatten();
         if let Some(old) = hooks.take() {
             uninstall(old);
         }
@@ -1997,14 +2515,11 @@ mod win {
                 REINSTALLS.fetch_add(1, Ordering::Relaxed);
                 LAST_REINSTALL_MS.store(now_ms().max(1), Ordering::Relaxed);
                 REASON.store(reason, Ordering::Relaxed);
-                send(Captured::HookReinstalled {
-                    removed: reason == REASON_REMOVED,
-                });
+                send(Captured::HookReinstalled { removed, session });
             }
             None => {
-                INSTALLED.store(false, Ordering::SeqCst);
                 set_forwarding(false);
-                send(Captured::HookFailed);
+                send(Captured::HookFailed { session });
             }
         }
     }
@@ -2063,7 +2578,7 @@ mod win {
     }
 
     fn spawn() -> Result<(std::thread::JoinHandle<()>, u32), String> {
-        let (ready, wait) = std::sync::mpsc::channel();
+        let (ready, wait) = std::sync::mpsc::sync_channel(0);
         let handle = std::thread::Builder::new()
             .name("traplink-input-hooks".into())
             .spawn(move || unsafe {
@@ -2073,15 +2588,19 @@ mod win {
                 let mut hooks = install();
                 if hooks.is_none() {
                     let _ = ready.send(Err(
-                        "Could not install the global mouse and keyboard capture."
-                            .to_string(),
+                        "Could not install the global mouse and keyboard capture.".to_string(),
                     ));
                     return;
                 }
                 let id = GetCurrentThreadId();
+                if ready.send(Ok(id)).is_err() {
+                    if let Some(hooks) = hooks.take() {
+                        uninstall(hooks);
+                    }
+                    return;
+                }
                 INSTALLED.store(true, Ordering::SeqCst);
                 THREAD_ID.store(id, Ordering::SeqCst);
-                let _ = ready.send(Ok(id));
                 let foreground = crate::remap::platform::install_foreground_hook();
                 let timer = SetTimer(std::ptr::null_mut(), 0, TIMER_MS, None);
                 let mut health = HookHealth::default();
@@ -2091,6 +2610,11 @@ mod win {
                 while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
                     match msg.message {
                         WM_TIMER => {
+                            if let Ok(guard) = CTX.lock() {
+                                if let Some(ctx) = guard.as_ref() {
+                                    release_stale_capture(ctx);
+                                }
+                            }
                             let now = Instant::now();
                             let current = screen::win::signature();
                             if current != signature
@@ -2147,8 +2671,8 @@ mod win {
     pub struct HookThread;
     impl HookThread {
         pub fn start(tx: UnboundedSender<Captured>) -> Result<Self, String> {
-            let layout = current_layout()
-                .ok_or_else(|| "Could not read the display layout.".to_string())?;
+            let layout =
+                current_layout().ok_or_else(|| "Could not read the display layout.".to_string())?;
             *CTX.lock().map_err(|_| "Flow lock unavailable.")? = Some(HookCtx {
                 logic: CaptureLogic::default(),
                 tx,
@@ -2180,6 +2704,7 @@ mod win {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::network::Wire;
 
     fn screen() -> Bounds {
         Bounds::new(0, 0, 1920, 1080).unwrap()
@@ -2248,6 +2773,297 @@ mod tests {
         assert!(tracker
             .update((0, 10), screen(), false, false, now)
             .is_some());
+    }
+
+    #[test]
+    fn rapid_reversals_rearm_from_the_return_inset_on_every_edge() {
+        let layout = Layout::single(screen());
+        let now = Instant::now();
+        for edge in [
+            FlowEdge::Left,
+            FlowEdge::Right,
+            FlowEdge::Top,
+            FlowEdge::Bottom,
+        ] {
+            let outward = match edge {
+                FlowEdge::Left => (-1, 0),
+                FlowEdge::Right => (1, 0),
+                FlowEdge::Top => (0, -1),
+                FlowEdge::Bottom => (0, 1),
+            };
+            for entry in [0.0, 0.5, 1.0] {
+                let mut logic = armed_logic(edge);
+                let point = layout.entry_point(edge, entry, EDGE_INSET_PX);
+                for _ in 0..20 {
+                    logic.start_forwarding(layout.virtual_bounds().center());
+                    logic.end_forwarding("peer");
+                    logic.rearm_after_return("peer", point);
+                    let sample = |dx, dy| RawEvent::Move {
+                        x: point.0 + dx,
+                        y: point.1 + dy,
+                        from: Some(point),
+                    };
+                    // Repositioning or sliding along the perpendicular edge
+                    // must stay local, even when the return landed at a corner.
+                    assert_eq!(
+                        logic.handle(sample(0, 0), false, false, &layout, now).1,
+                        None
+                    );
+                    let tangent = if outward.0 != 0 { (0, 1) } else { (1, 0) };
+                    assert_eq!(
+                        logic
+                            .handle(sample(tangent.0, tangent.1), false, false, &layout, now)
+                            .1,
+                        None
+                    );
+                    let reversal = sample(4 * outward.0 + tangent.0, 4 * outward.1 + tangent.1);
+                    assert!(
+                        matches!(
+                            logic.handle(reversal, false, false, &layout, now).1,
+                            Some(Captured::EdgeHit { .. })
+                        ),
+                        "{edge:?} / {entry}"
+                    );
+                    assert_eq!(logic.handle(reversal, false, false, &layout, now).1, None);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_return_keeps_the_modifier_button_and_dwell_protections() {
+        let now = Instant::now();
+        let edge = FlowEdge::Left;
+        let point = screen().point_on(edge, 0.5, EDGE_INSET_PX);
+        let push = (-1, point.1);
+        let mut tracker = EdgeTracker::new(config(edge, FlowMode::CtrlEdge, 250, true));
+        tracker.rearm_after_return(point);
+        assert_eq!(tracker.update(push, screen(), false, false, now), None);
+        assert_eq!(tracker.update(push, screen(), true, true, now), None);
+        assert!(tracker.update(push, screen(), false, true, now).is_some());
+
+        let mut tracker = EdgeTracker::new(config(edge, FlowMode::Edge, 250, true));
+        tracker.rearm_after_return(point);
+        assert_eq!(tracker.update(push, screen(), false, false, now), None);
+        assert_eq!(
+            tracker.update(
+                push,
+                screen(),
+                false,
+                false,
+                now + Duration::from_millis(249)
+            ),
+            None
+        );
+        assert!(tracker
+            .update(
+                push,
+                screen(),
+                false,
+                false,
+                now + Duration::from_millis(250)
+            )
+            .is_some());
+    }
+
+    #[test]
+    fn a_pending_crossing_stays_on_its_original_exposed_display_edge() {
+        let layout = Layout::new(vec![
+            Bounds::new(0, 0, 200, 200).unwrap(),
+            Bounds::new(200, 100, 200, 100).unwrap(),
+        ])
+        .unwrap();
+        let mut logic = armed_logic(FlowEdge::Right);
+        let now = Instant::now();
+        let sample = |x, y, from| RawEvent::Move {
+            x,
+            y,
+            from: Some(from),
+        };
+        assert!(matches!(
+            logic
+                .handle(sample(204, 0, (199, 0)), false, false, &layout, now)
+                .1,
+            Some(Captured::EdgeHit { .. })
+        ));
+        // Slipping a few pixels inward or sliding along the exposed edge
+        // leaves the original crossing intact, including at its corner.
+        assert!(logic.still_at_crossing("peer", now, &layout, Some((198, 0))));
+        assert!(logic.still_at_crossing("peer", now, &layout, Some((199, 99))));
+        assert!(!logic.still_at_crossing("peer", now, &layout, Some((174, 20))));
+        assert!(!logic.still_at_crossing("peer", now, &layout, Some((199, 100))));
+        assert!(!logic.still_at_crossing("peer", now, &layout, Some((399, 100))));
+
+        logic.handle(sample(199, 100, (199, 99)), false, false, &layout, now);
+        assert!(!logic.still_at_crossing("peer", now, &layout, Some((199, 20))));
+        let next = now + Duration::from_millis(10);
+        logic.handle(sample(203, 20, (199, 20)), false, false, &layout, next);
+        assert!(!logic.still_at_crossing("peer", now, &layout, Some((199, 20))));
+        assert!(logic.still_at_crossing("peer", next, &layout, Some((199, 20))));
+        assert!(
+            matches!(logic.after_retreat("peer", now), Some(Captured::EdgeHit { at, .. }) if at == next)
+        );
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[tokio::test]
+    async fn delayed_start_ack_respects_the_physical_cursor_and_releases_a_cancelled_receiver() {
+        let layout = Layout::single(screen());
+        for retreat in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let core = Core::for_test(directory.path().to_path_buf(), 48372);
+            let mode = config(FlowEdge::Right, FlowMode::Edge, 0, true);
+            let hit = Instant::now();
+            let logic = Arc::new(std::sync::Mutex::new(armed_logic(mode.edge)));
+            let sample = |x, y| RawEvent::Move {
+                x,
+                y,
+                from: Some((1919, y)),
+            };
+            logic
+                .lock()
+                .unwrap()
+                .handle(sample(1922, 540), false, false, &layout, hit);
+            let (outgoing, mut packets) = tokio::sync::mpsc::channel(4);
+            let (cancel, _) = tokio::sync::watch::channel(false);
+            let link = Arc::new(Session::new(outgoing, cancel, Uuid::new_v4()));
+            let (notifications, _events) = unbounded_channel();
+            let controller = Uuid::new_v4();
+            let token = {
+                let mut state = core.input.lock().unwrap();
+                state.flow.controller = Some(Controller {
+                    id: controller,
+                    tx: notifications,
+                    hook: platform::HookThread,
+                });
+                state.flow.peers.insert("peer".into(), mode);
+                state.sending_to = Some("peer".into());
+                state
+                    .flow
+                    .begin_switch("peer", mode.edge, hit, link)
+                    .unwrap()
+            };
+            let source = logic.clone();
+            let source_layout = layout.clone();
+            let pending = tokio::spawn(complete_start(
+                core.clone(),
+                controller,
+                "peer".into(),
+                token,
+                mode,
+                0.5,
+                move |_, peer, at| {
+                    Ok(source
+                        .lock()
+                        .unwrap()
+                        .still_at_crossing(peer, at, &source_layout, None))
+                },
+            ));
+            let request = packets.recv().await.unwrap();
+            assert!(
+                matches!(request.message, Wire::FlowStart { session: Some(id), .. } if id == token)
+            );
+            let x = if retreat { 1800 } else { 1917 };
+            logic.lock().unwrap().handle(
+                sample(x, 535),
+                false,
+                false,
+                &layout,
+                hit + Duration::from_millis(30),
+            );
+            request.result.unwrap().send(Ok(())).unwrap();
+            pending.await.unwrap();
+            let state = core.input.lock().unwrap();
+            assert!(state.flow.last_error.is_none());
+            if retreat {
+                assert_eq!(state.flow.switch, Switch::Local);
+                assert!(!state.busy());
+                assert!(state.flow.last_handoff.is_none());
+                let stop = packets.try_recv().unwrap().message;
+                assert!(
+                    matches!(stop, Wire::Flow { session, packet: FlowPacket::Stop } if session == token)
+                );
+            } else {
+                assert_eq!(state.flow.forwarding(), Some("peer"));
+                assert!(state.flow.last_handoff.is_some());
+                assert!(packets.try_recv().is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn a_late_return_from_the_same_peer_preserves_the_next_visit() {
+        let directory = tempfile::tempdir().unwrap();
+        let core = Core::for_test(directory.path().to_path_buf(), 48372);
+        let now = Instant::now();
+        let (outgoing, _rx) = tokio::sync::mpsc::channel(1);
+        let (cancel, _) = tokio::sync::watch::channel(false);
+        let link = Arc::new(Session::new(outgoing, cancel, Uuid::new_v4()));
+        let start_visit = || {
+            let mut state = core.input.lock().unwrap();
+            let token = state
+                .flow
+                .begin_switch("peer", FlowEdge::Left, now, link.clone())
+                .unwrap();
+            state.sending_to = Some("peer".into());
+            assert!(state.flow.switch.apply(SwitchEvent::Started {
+                peer: "peer".into(),
+                ok: true
+            }));
+            token
+        };
+        let first = start_visit();
+        assert!(returned(&core, "peer", Some(first), 1.0).unwrap());
+        let second = start_visit();
+        assert_ne!(first, second);
+        assert!(!returned(&core, "peer", None, 0.0).unwrap());
+        assert!(!returned(&core, "peer", Some(first), 0.0).unwrap());
+        assert!(!returned(&core, "other", Some(second), 0.0).unwrap());
+        assert!(core
+            .input
+            .lock()
+            .unwrap()
+            .flow
+            .matches_session("peer", second));
+        assert!(returned(&core, "peer", Some(second), 0.5).unwrap());
+        let state = core.input.lock().unwrap();
+        assert_eq!(state.flow.switch_id(), None);
+        assert!(!state.busy());
+    }
+
+    #[test]
+    fn only_the_confirmed_visit_records_edge_to_capture_time() {
+        let (outgoing, _rx) = tokio::sync::mpsc::channel(1);
+        let (cancel, _) = tokio::sync::watch::channel(false);
+        let link = Arc::new(Session::new(outgoing, cancel, Uuid::new_v4()));
+        let mut flow = FlowState::default();
+        let edge_hit = Instant::now();
+        let previous = flow
+            .begin_switch("peer", FlowEdge::Left, edge_hit, link.clone())
+            .unwrap();
+        assert!(flow.confirm_switch("peer", previous, edge_hit + Duration::from_millis(17)));
+        assert_eq!(flow.last_handoff.as_ref().unwrap().elapsed_ms, 17);
+        assert!(flow.switch.apply(SwitchEvent::Lost {
+            peer: "peer".into()
+        }));
+
+        let next_hit = edge_hit + Duration::from_secs(1);
+        let next = flow
+            .begin_switch("peer", FlowEdge::Left, next_hit, link)
+            .unwrap();
+        assert!(!flow.confirm_switch("peer", previous, next_hit));
+        assert!(!flow.confirm_switch("other", next, next_hit));
+        assert_eq!(flow.last_handoff.as_ref().unwrap().elapsed_ms, 17);
+        assert!(flow.confirm_switch("peer", next, next_hit + Duration::from_millis(3)));
+        assert_eq!(
+            flow.last_handoff,
+            Some(FlowTiming {
+                peer: "peer".into(),
+                elapsed_ms: 3
+            })
+        );
+        assert!(!flow.confirm_switch("peer", next, next_hit + Duration::from_secs(2)));
+        assert_eq!(flow.last_handoff.as_ref().unwrap().elapsed_ms, 3);
     }
 
     #[test]
@@ -2406,21 +3222,53 @@ mod tests {
         let now = Instant::now();
         let s = &Layout::single(screen());
         assert_eq!(
-            logic.handle(RawEvent::Move { x: 1919, y: 0, from: None }, true, false, s, now),
+            logic.handle(
+                RawEvent::Move {
+                    x: 1919,
+                    y: 0,
+                    from: None
+                },
+                true,
+                false,
+                s,
+                now
+            ),
             (Verdict::Pass, None)
         );
-        let (verdict, out) = logic.handle(RawEvent::Move { x: 1921, y: 0, from: None }, false, false, s, now);
+        let (verdict, out) = logic.handle(
+            RawEvent::Move {
+                x: 1921,
+                y: 0,
+                from: None,
+            },
+            false,
+            false,
+            s,
+            now,
+        );
         assert_eq!(verdict, Verdict::Pass);
         assert_eq!(
             out,
             Some(Captured::EdgeHit {
                 peer: "peer".into(),
-                entry: 0.0
+                entry: 0.0,
+                generation: logic.generation,
+                at: now,
             })
         );
         logic.start_forwarding((960, 540));
         assert_eq!(
-            logic.handle(RawEvent::Move { x: 970, y: 535, from: None }, false, true, s, now),
+            logic.handle(
+                RawEvent::Move {
+                    x: 970,
+                    y: 535,
+                    from: None
+                },
+                false,
+                true,
+                s,
+                now
+            ),
             (Verdict::Swallow, Some(Captured::Move { dx: 10, dy: -5 }))
         );
         let key = RawEvent::Key {
@@ -2537,9 +3385,20 @@ mod tests {
         let mut logic = armed_logic(FlowEdge::Right);
         let s = &Layout::single(screen());
         let now = Instant::now();
-        assert_eq!(logic.handle(key(0x38, false, true), false, false, s, now).0, Verdict::Pass);
-        assert_eq!(logic.handle(key(0x0F, false, true), false, false, s, now).0, Verdict::Pass);
-        assert_eq!(logic.handle(key(0x0F, false, false), false, false, s, now).0, Verdict::Pass);
+        assert_eq!(
+            logic.handle(key(0x38, false, true), false, false, s, now).0,
+            Verdict::Pass
+        );
+        assert_eq!(
+            logic.handle(key(0x0F, false, true), false, false, s, now).0,
+            Verdict::Pass
+        );
+        assert_eq!(
+            logic
+                .handle(key(0x0F, false, false), false, false, s, now)
+                .0,
+            Verdict::Pass
+        );
         logic.start_forwarding((960, 540));
         assert_eq!(
             logic.handle(key(0x38, false, true), false, true, s, now),
@@ -2736,7 +3595,17 @@ mod tests {
         let now = Instant::now();
         assert_eq!(
             logic
-                .handle(RawEvent::Move { x: 0, y: 5, from: None }, false, false, s, now)
+                .handle(
+                    RawEvent::Move {
+                        x: 0,
+                        y: 5,
+                        from: None
+                    },
+                    false,
+                    false,
+                    s,
+                    now
+                )
                 .1,
             None
         );
@@ -2763,7 +3632,17 @@ mod tests {
         );
         assert_eq!(
             logic
-                .handle(RawEvent::Move { x: 0, y: 5, from: None }, false, false, s, now)
+                .handle(
+                    RawEvent::Move {
+                        x: 0,
+                        y: 5,
+                        from: None
+                    },
+                    false,
+                    false,
+                    s,
+                    now
+                )
                 .1,
             None
         );
@@ -2779,7 +3658,17 @@ mod tests {
         );
         assert!(matches!(
             logic
-                .handle(RawEvent::Move { x: 0, y: 5, from: None }, false, false, s, now)
+                .handle(
+                    RawEvent::Move {
+                        x: 0,
+                        y: 5,
+                        from: None
+                    },
+                    false,
+                    false,
+                    s,
+                    now
+                )
                 .1,
             Some(Captured::EdgeHit { .. })
         ));
@@ -2832,17 +3721,27 @@ mod tests {
             tracker.update_layout((0, 500), None, &layout, false, false, now),
             None
         );
-        let entry = tracker.update_layout((-2561, -360), Some((-2560, -360)), &layout, false, false, now)
+        let entry = tracker
+            .update_layout(
+                (-2561, -360),
+                Some((-2560, -360)),
+                &layout,
+                false,
+                false,
+                now,
+            )
             .unwrap();
         assert!(entry.abs() < 1e-9, "top of the virtual desktop is entry 0");
         let top = || EdgeTracker::new(config(FlowEdge::Top, FlowMode::Edge, 0, true));
-        assert!(top().update_layout((500, 0), None, &layout, false, false, now)
+        assert!(top()
+            .update_layout((500, 0), None, &layout, false, false, now)
             .is_some());
         assert_eq!(
             top().update_layout((-500, 0), None, &layout, false, false, now),
             None
         );
-        assert!(top().update_layout((-500, -360), None, &layout, false, false, now)
+        assert!(top()
+            .update_layout((-500, -360), None, &layout, false, false, now)
             .is_some());
     }
 
@@ -2864,10 +3763,24 @@ mod tests {
         logic.set_arm("peer", config(FlowEdge::Left, FlowMode::Edge, 0, true));
         let layout = mixed();
         let now = Instant::now();
-        let seam = logic.handle(RawEvent::Move { x: 0, y: 200, from: None }, false, false, &layout, now);
+        let seam = logic.handle(
+            RawEvent::Move {
+                x: 0,
+                y: 200,
+                from: None,
+            },
+            false,
+            false,
+            &layout,
+            now,
+        );
         assert_eq!(seam, (Verdict::Pass, None));
         let outer = logic.handle(
-            RawEvent::Move { x: -2560, y: 200, from: None },
+            RawEvent::Move {
+                x: -2560,
+                y: 200,
+                from: None,
+            },
             false,
             false,
             &layout,
@@ -3025,11 +3938,21 @@ mod tests {
         assert!(status.peers.is_empty());
     }
 
-    #[test]
-    fn turning_flow_off_removes_the_saved_choice() {
+    #[tokio::test]
+    async fn turning_flow_off_removes_the_saved_choice() {
         let (directory, core, id) = saved_fixture();
-        let status = configure(&core, &id, false, FlowEdge::Right, FlowMode::Edge, 250, true, false)
-            .unwrap();
+        let status = configure(
+            &core,
+            &id,
+            false,
+            FlowEdge::Right,
+            FlowMode::Edge,
+            250,
+            true,
+            false,
+        )
+        .await
+        .unwrap();
         assert!(status.saved.is_empty());
         let reloaded = crate::storage::load(directory.path(), "ignored".into()).unwrap();
         assert!(reloaded.flow_peers.is_empty());
@@ -3115,8 +4038,13 @@ mod tests {
                 samples.push(((x, b), (2.0, 6.0)));
                 samples.push(((x, b), (0.0, 6.0)));
             }
-            for (corner, vertical) in [((l, t), -1.0), ((r, t), -1.0), ((l, b), 1.0), ((r, b), 1.0)] {
-                for d in [(0.0, 30.0 * vertical), (8.0, 8.0 * vertical), (3.0, 30.0 * vertical)] {
+            for (corner, vertical) in [((l, t), -1.0), ((r, t), -1.0), ((l, b), 1.0), ((r, b), 1.0)]
+            {
+                for d in [
+                    (0.0, 30.0 * vertical),
+                    (8.0, 8.0 * vertical),
+                    (3.0, 30.0 * vertical),
+                ] {
                     for _ in 0..8 {
                         samples.push((corner, d));
                     }
@@ -3142,8 +4070,22 @@ mod tests {
                         location.1.floor() as i32 + delta.1 as i32,
                     );
                     for (x, y) in [mac, raw] {
-                        let out = logic.handle(RawEvent::Move { x, y, from: Some(cursor) }, false, false, &layout, now);
-                        assert_eq!(out, (Verdict::Pass, None), "{name} delay {delay} at {x},{y}");
+                        let out = logic.handle(
+                            RawEvent::Move {
+                                x,
+                                y,
+                                from: Some(cursor),
+                            },
+                            false,
+                            false,
+                            &layout,
+                            now,
+                        );
+                        assert_eq!(
+                            out,
+                            (Verdict::Pass, None),
+                            "{name} delay {delay} at {x},{y}"
+                        );
                     }
                 }
                 let v = layout.virtual_bounds();
@@ -3167,7 +4109,10 @@ mod tests {
                             .1
                     })
                     .count();
-                assert_eq!(hits, 1, "{name} delay {delay}: the armed edge switches once");
+                assert_eq!(
+                    hits, 1,
+                    "{name} delay {delay}: the armed edge switches once"
+                );
             }
         }
     }
@@ -3208,16 +4153,31 @@ mod tests {
             sweep(&mut corner, -9, -9, 20);
             assert_eq!(corner, (left.left, left.top), "{name}: rests in the corner");
             sweep(&mut corner, 0, 25, 4);
-            assert_eq!(corner, (left.left, left.top + 100), "{name}: slides along the edge");
+            assert_eq!(
+                corner,
+                (left.left, left.top + 100),
+                "{name}: slides along the edge"
+            );
             sweep(&mut corner, -9, 0, 4);
-            assert_eq!(corner.0, left.left, "{name}: the left edge only stops the pointer");
+            assert_eq!(
+                corner.0, left.left,
+                "{name}: the left edge only stops the pointer"
+            );
             sweep(&mut corner, 30, 0, 3);
             assert_eq!(corner.0, left.left + 90, "{name}: leaves the edge freely");
             let mut bottom = (left.left + 200, left.bottom);
             sweep(&mut bottom, -2, 9, 10);
-            assert_eq!(bottom, (left.left + 180, left.bottom), "{name}: slides along the bottom");
+            assert_eq!(
+                bottom,
+                (left.left + 180, left.bottom),
+                "{name}: slides along the bottom"
+            );
             sweep(&mut bottom, 0, -40, 2);
-            assert_eq!(bottom.1, left.bottom - 80, "{name}: leaves the bottom freely");
+            assert_eq!(
+                bottom.1,
+                left.bottom - 80,
+                "{name}: leaves the bottom freely"
+            );
             let mut right = start;
             let mut returned = None;
             for _ in 0..4000 {
@@ -3245,7 +4205,8 @@ mod tests {
                 for (location, delta) in [((0.0, 0.0), (0.0, -6.0)), ((0.0, 981.5), (0.0, 6.0))] {
                     let (x, y) = crate::screen::pointer_sample(&layout, location, delta);
                     let from = Some(crate::screen::pointer_location(&layout, location));
-                    let out = logic.handle(RawEvent::Move { x, y, from }, false, false, &layout, now);
+                    let out =
+                        logic.handle(RawEvent::Move { x, y, from }, false, false, &layout, now);
                     assert_eq!(out, (Verdict::Pass, None), "delay {delay} at {x},{y}");
                 }
             }
@@ -3259,7 +4220,10 @@ mod tests {
                         .1
                 })
                 .count();
-            assert_eq!(hits, 1, "delay {delay}: pushing out past the armed edge still switches");
+            assert_eq!(
+                hits, 1,
+                "delay {delay}: pushing out past the armed edge still switches"
+            );
         }
     }
 

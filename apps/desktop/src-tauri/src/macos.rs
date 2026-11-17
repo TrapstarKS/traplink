@@ -1,5 +1,5 @@
 #![allow(non_upper_case_globals, non_snake_case, dead_code)]
-use std::ffi::c_void;
+use std::{ffi::c_void, time::Duration};
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -43,6 +43,7 @@ extern "C" {
     pub fn CGDisplayShowCursor(display: u32) -> i32;
     pub fn CGEventCreate(source: *const c_void) -> CGEventRef;
     pub fn CGEventGetLocation(event: CGEventRef) -> CGPoint;
+    pub fn CGEventGetTimestamp(event: CGEventRef) -> u64;
     pub fn CGEventGetIntegerValueField(event: CGEventRef, field: u32) -> i64;
     pub fn CGEventGetDoubleValueField(event: CGEventRef, field: u32) -> f64;
     pub fn CGEventGetFlags(event: CGEventRef) -> u64;
@@ -113,6 +114,10 @@ extern "C" {
     fn LMGetKbdType() -> u8;
 }
 
+extern "C" {
+    fn clock_gettime_nsec_np(clock_id: u32) -> u64;
+}
+
 pub fn displays() -> Vec<(f64, f64, f64, f64)> {
     let mut ids = [0u32; 32];
     let mut count = 0u32;
@@ -142,18 +147,54 @@ pub fn cursor() -> Option<CGPoint> {
         (point.x.is_finite() && point.y.is_finite()).then_some(point)
     }
 }
-pub fn warp((x, y): (i32, i32), reconnect: bool) {
+pub fn current_event_timestamp() -> u64 {
+    // CGEventTimestamp and CLOCK_UPTIME_RAW both measure awake uptime in
+    // nanoseconds. A new, unposted CGEvent has no guaranteed timestamp.
+    const CLOCK_UPTIME_RAW: u32 = 8;
+    unsafe { clock_gettime_nsec_np(CLOCK_UPTIME_RAW) }
+}
+pub fn warp((x, y): (i32, i32)) -> bool {
     unsafe {
         CGWarpMouseCursorPosition(CGPoint {
             x: f64::from(x),
             y: f64::from(y),
-        });
-        if reconnect {
-            CGAssociateMouseAndMouseCursorPosition(1);
-        }
+        }) == 0
     }
 }
-pub const INJECTED_MARKER: i64 = 100;
+pub const INJECTED_MARKER: i64 = i64::from_be_bytes(*b"TrapLink");
+const SOURCE_USER_DATA: u32 = 42;
+const HID_TAP: u32 = 0;
+const COMBINED_SESSION_STATE: i32 = 0;
+
+// The same Quartz point coordinates must be used for motion and button events.
+// Mixing AppKit points with a display's backing-pixel height moves clicks to a
+// different row on Retina displays.
+unsafe fn post_mouse(
+    event_type: u32,
+    (x, y): (i32, i32),
+    button: u32,
+    prepare: impl FnOnce(CGEventRef),
+) -> bool {
+    let event = CGEventCreateMouseEvent(
+        std::ptr::null(),
+        event_type,
+        CGPoint {
+            x: f64::from(x),
+            y: f64::from(y),
+        },
+        button,
+    );
+    if event.is_null() {
+        return false;
+    }
+    CGEventSetIntegerValueField(event, SOURCE_USER_DATA, INJECTED_MARKER);
+    CGEventSetFlags(event, CGEventSourceFlagsState(COMBINED_SESSION_STATE));
+    prepare(event);
+    CGEventPost(HID_TAP, event);
+    CFRelease(event as CFTypeRef);
+    true
+}
+
 pub fn post_mouse_move((x, y): (i32, i32), (dx, dy): (i32, i32), drag: Option<u32>) -> bool {
     const MOUSE_MOVED: u32 = 5;
     const LEFT_DRAGGED: u32 = 6;
@@ -162,9 +203,6 @@ pub fn post_mouse_move((x, y): (i32, i32), (dx, dy): (i32, i32), drag: Option<u3
     const BUTTON_NUMBER: u32 = 3;
     const DELTA_X: u32 = 4;
     const DELTA_Y: u32 = 5;
-    const SOURCE_USER_DATA: u32 = 42;
-    const HID_TAP: u32 = 0;
-    const COMBINED_SESSION_STATE: i32 = 0;
     let (event_type, button) = match drag {
         Some(0) => (LEFT_DRAGGED, 0),
         Some(1) => (RIGHT_DRAGGED, 1),
@@ -172,40 +210,48 @@ pub fn post_mouse_move((x, y): (i32, i32), (dx, dy): (i32, i32), drag: Option<u3
         None => (MOUSE_MOVED, 0),
     };
     unsafe {
-        let event = CGEventCreateMouseEvent(
-            std::ptr::null(),
-            event_type,
-            CGPoint {
-                x: f64::from(x),
-                y: f64::from(y),
-            },
-            button,
-        );
-        if event.is_null() {
-            return false;
-        }
-        if event_type == OTHER_DRAGGED {
-            CGEventSetIntegerValueField(event, BUTTON_NUMBER, i64::from(button));
-        }
-        CGEventSetIntegerValueField(event, DELTA_X, i64::from(dx));
-        CGEventSetIntegerValueField(event, DELTA_Y, i64::from(dy));
-        CGEventSetIntegerValueField(event, SOURCE_USER_DATA, INJECTED_MARKER);
-        CGEventSetFlags(event, CGEventSourceFlagsState(COMBINED_SESSION_STATE));
-        CGEventPost(HID_TAP, event);
-        CFRelease(event as CFTypeRef);
+        post_mouse(event_type, (x, y), button, |event| {
+            if event_type == OTHER_DRAGGED {
+                CGEventSetIntegerValueField(event, BUTTON_NUMBER, i64::from(button));
+            }
+            CGEventSetIntegerValueField(event, DELTA_X, i64::from(dx));
+            CGEventSetIntegerValueField(event, DELTA_Y, i64::from(dy));
+        })
     }
-    true
 }
-pub fn associate(connected: bool) {
-    unsafe { CGAssociateMouseAndMouseCursorPosition(i32::from(connected)) };
-}
-pub fn hide_cursor(hidden: bool) {
+
+pub fn post_mouse_button(point: (i32, i32), button: u32, down: bool, clicks: i64) -> bool {
+    const CLICK_STATE: u32 = 1;
+    const BUTTON_NUMBER: u32 = 3;
+    let event_type = match (button, down) {
+        (0, true) => 1,
+        (0, false) => 2,
+        (1, true) => 3,
+        (1, false) => 4,
+        (_, true) => 25,
+        (_, false) => 26,
+    };
     unsafe {
-        if hidden {
-            CGDisplayHideCursor(0);
+        post_mouse(event_type, point, button, |event| {
+            CGEventSetIntegerValueField(event, BUTTON_NUMBER, i64::from(button));
+            CGEventSetIntegerValueField(event, CLICK_STATE, clicks);
+        })
+    }
+}
+
+pub fn double_click_interval() -> Duration {
+    Duration::try_from_secs_f64(objc2_app_kit::NSEvent::doubleClickInterval()).unwrap_or_default()
+}
+pub fn associate(connected: bool) -> bool {
+    unsafe { CGAssociateMouseAndMouseCursorPosition(i32::from(connected)) == 0 }
+}
+pub fn hide_cursor(hidden: bool) -> bool {
+    unsafe {
+        (if hidden {
+            CGDisplayHideCursor(0)
         } else {
-            CGDisplayShowCursor(0);
-        }
+            CGDisplayShowCursor(0)
+        }) == 0
     }
 }
 pub fn accessibility_trusted(prompt: bool) -> bool {
