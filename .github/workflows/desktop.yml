@@ -1,0 +1,151 @@
+name: Desktop release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)build, e.g. v0.1.0. The release must not be published yet."
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: desktop-release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+  GH_TOKEN: ${{ github.token }}
+  CI: "true"
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+  RELEASE_PLATFORMS: ${{ vars.RELEASE_PLATFORMS || 'windows,macos' }}
+
+jobs:
+  prepare:
+    name: Prepare draft release
+    runs-on: [self-hosted, Windows, X64, traplink]
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+      matrix: ${{ steps.platforms.outputs.matrix }}
+    steps:
+      - id: platforms
+        name: Select platforms
+        shell: powershell
+        run: |
+          $all = @{
+            windows = @{ name = 'Windows x64'; platform = 'windows'; runner = @('self-hosted', 'Windows', 'X64', 'traplink') }
+            macos = @{ name = 'macOS Apple Silicon'; platform = 'macos'; runner = @('self-hosted', 'macOS', 'ARM64', 'traplink') }
+          }
+          $selected = @($env:RELEASE_PLATFORMS -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+          foreach ($name in $selected) { if (-not $all.ContainsKey($name)) { Write-Error "Unknown platform: $name"; exit 1 } }
+          $json = ConvertTo-Json -Compress -Depth 4 @($selected | ForEach-Object { $all[$_] })
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "matrix=$json"
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+          persist-credentials: false
+      - name: Check toolchain
+        shell: powershell
+        run: |
+          node --version; if ($LASTEXITCODE) { exit 1 }
+          gh --version; if ($LASTEXITCODE) { exit 1 }
+      - id: release
+        name: Validate versions and create draft release
+        run: node scripts/release/release.mjs prepare
+
+  build:
+    name: Build ${{ matrix.name }}
+    needs: prepare
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    env:
+      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: refs/tags/${{ needs.prepare.outputs.tag }}
+          persist-credentials: false
+
+      - name: Use machine toolchain (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          if (Test-Path 'C:\rust\cargo\bin') { Add-Content -Path $env:GITHUB_PATH -Value 'C:\rust\cargo\bin' }
+          Add-Content -Path $env:GITHUB_ENV -Value ("CARGO_TARGET_DIR=" + (Join-Path (Split-Path $env:GITHUB_WORKSPACE -Parent) 'cargo-target'))
+      - name: Use machine toolchain (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          for dir in "$HOME/.cargo/bin" /opt/homebrew/bin /usr/local/bin; do
+            if [ -d "$dir" ]; then echo "$dir" >> "$GITHUB_PATH"; fi
+          done
+          echo "CARGO_TARGET_DIR=$(dirname "$GITHUB_WORKSPACE")/cargo-target" >> "$GITHUB_ENV"
+
+      - name: Check toolchain
+        run: |
+          node --version
+          pnpm --version
+          rustc --version
+          cargo --version
+          gh --version
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Typecheck
+        run: pnpm --filter @traplink/desktop typecheck
+      - name: Rust tests
+        run: cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --locked
+      - name: Prepare macOS code signing
+        if: runner.os == 'macOS'
+        shell: bash
+        run: bash scripts/release/macos-signing.sh setup
+        env:
+          MAC_CERT_P12: ${{ secrets.MAC_CERT_P12 }}
+          MAC_CERT_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
+      - name: Build signed updater bundles
+        run: pnpm --filter @traplink/desktop tauri build
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+      - name: Verify macOS code signature
+        if: runner.os == 'macOS'
+        shell: bash
+        run: bash scripts/release/macos-signing.sh verify "$CARGO_TARGET_DIR/release/bundle/macos/TrapLink.app"
+      - name: Remove macOS signing files
+        if: always() && runner.os == 'macOS'
+        shell: bash
+        run: bash scripts/release/macos-signing.sh cleanup
+      - name: Upload to draft release
+        run: node scripts/release/release.mjs upload ${{ matrix.platform }}
+
+  publish:
+    name: Publish release and latest.json
+    needs: [prepare, build]
+    runs-on: [self-hosted, Windows, X64, traplink]
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: refs/tags/${{ needs.prepare.outputs.tag }}
+          persist-credentials: false
+      - name: Merge updater entries and publish
+        run: node scripts/release/release.mjs finalize

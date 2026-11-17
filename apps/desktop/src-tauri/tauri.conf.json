@@ -1,0 +1,63 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "TrapLink",
+  "version": "0.1.9",
+  "identifier": "app.traplink.desktop",
+  "build": {
+    "beforeDevCommand": "pnpm dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "pnpm build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "TrapLink",
+        "width": 1280,
+        "height": 860,
+        "minWidth": 940,
+        "minHeight": 680,
+        "visible": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' asset: http://asset.localhost data:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; connect-src ipc: http://ipc.localhost; script-src 'self'",
+      "capabilities": [
+        "main-window"
+      ]
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "nsis",
+      "app",
+      "dmg"
+    ],
+    "category": "Utility",
+    "shortDescription": "Local-first device companion",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "createUpdaterArtifacts": true,
+    "macOS": {
+      "signingIdentity": "D934EC229FC79817F099C49D2D69FE41DBA7FC18"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/TrapstarKS/traplink/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDY5OUFCMDcxMzAyMjNFODIKUldTQ1BpSXdjYkNhYVRrMWNPRzl0UWZXcmxwZzk3dzJXSTBTWFdmQzFNT0JPU1ppLzI2cEs4V3EK",
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  }
+}

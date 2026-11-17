@@ -1,0 +1,61 @@
+[package]
+name = "traplink"
+version = "0.1.9"
+description = "Local-first desktop device and sharing companion"
+authors = ["TrapLink"]
+edition = "2021"
+rust-version = "1.88"
+
+[lib]
+name = "traplink_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+rfd = "0.16"
+tauri-plugin-opener = "2"
+tauri-plugin-global-shortcut = "2"
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
+tauri-plugin-autostart = "2"
+tauri-plugin-single-instance = "2"
+tauri-plugin-notification = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "fs"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+snow = "0.10"
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.8"
+keyring = { version = "3.6", features = ["apple-native", "windows-native"] }
+hidapi = { version = "2.6", default-features = false, features = ["windows-native", "macos-shared-device", "linux-native-basic-udev"] }
+arboard = { version = "3.6", default-features = false }
+local-ip-address = "0.6"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+url = "2"
+tempfile = "3"
+argon2 = { version = "0.5.3", features = ["zeroize"] }
+chacha20poly1305 = "0.10.1"
+zeroize = "1"
+socket2 = "0.6"
+
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
+enigo = "0.6"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Devices_DeviceAndDriverInstallation", "Win32_Devices_Properties", "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Media", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_UI_Accessibility", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+strip = true
+panic = "abort"

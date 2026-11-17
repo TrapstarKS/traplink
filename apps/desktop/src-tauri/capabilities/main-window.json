@@ -1,0 +1,12 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main-window",
+  "description": "The local TrapLink window can select files, listen for application events and check, install and apply signed updates after the user asks.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "updater:allow-check",
+    "updater:allow-download-and-install",
+    "process:allow-restart"
+  ]
+}

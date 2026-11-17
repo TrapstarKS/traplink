@@ -1,0 +1,42 @@
+name: Prune old releases
+
+on:
+  workflow_dispatch:
+    inputs:
+      keep:
+        description: "How many published releases to keep"
+        required: true
+        default: "3"
+        type: string
+      apply:
+        description: "Actually delete (unchecked = dry run)"
+        required: true
+        default: false
+        type: boolean
+
+permissions: {}
+
+concurrency:
+  group: prune-releases
+  cancel-in-progress: false
+
+jobs:
+  prune:
+    runs-on: [self-hosted, Windows, X64, traplink]
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      KEEP: ${{ inputs.keep }}
+      APPLY: ${{ inputs.apply }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - name: Prune
+        shell: powershell
+        run: |
+          if ($env:KEEP -notmatch '^[1-9][0-9]*$') { throw 'keep must be a positive integer' }
+          if ($env:APPLY -eq 'true') { node scripts/release/release.mjs prune --keep $env:KEEP --yes } else { node scripts/release/release.mjs prune --keep $env:KEEP }
+          exit $LASTEXITCODE
