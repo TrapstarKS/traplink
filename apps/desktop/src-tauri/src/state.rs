@@ -30,6 +30,7 @@ pub struct Core {
     pub auth_gate: tokio::sync::Mutex<()>,
     pub auth_epoch: AtomicU64,
     pub input: Mutex<crate::input::InputState>,
+    pub clipboard: crate::clipboard::Clipboard,
     pub consent: Mutex<crate::consent::ConsentState>,
     pub client: reqwest::Client,
 }
@@ -64,6 +65,7 @@ impl Core {
             auth_gate: tokio::sync::Mutex::new(()),
             auth_epoch: AtomicU64::new(0),
             input: Mutex::new(Default::default()),
+            clipboard: crate::clipboard::Clipboard::in_memory(),
             consent: Mutex::new(Default::default()),
             client: reqwest::Client::new(),
         })
@@ -105,6 +107,7 @@ impl Core {
             auth_gate: tokio::sync::Mutex::new(()),
             auth_epoch: AtomicU64::new(0),
             input: Mutex::new(Default::default()),
+            clipboard: crate::clipboard::Clipboard::native(),
             consent: Mutex::new(Default::default()),
             client,
         }))

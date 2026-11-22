@@ -1470,7 +1470,7 @@ fn record_link(
         Ok(()) => link.connected(),
         Err(error) => {
             link.failed(backoff, Instant::now(), link::jitter(), error.clone());
-            if link.gave_up {
+            if link.attempt >= backoff.fast_attempts {
                 flow.last_error = Some(FlowError::new("reconnect_failed", peer, error));
             }
         }
@@ -1645,10 +1645,7 @@ async fn complete_start(
         return;
     }
     if config.clipboard && crate::network::clipboard_permitted(&core, peer) {
-        let (core, peer) = (core.clone(), peer.to_string());
-        tokio::spawn(async move {
-            let _ = crate::network::send_clipboard(core, &peer).await;
-        });
+        crate::network::share_clipboard_on_switch(core.clone(), peer.to_string());
     }
 }
 
@@ -1700,7 +1697,6 @@ pub struct FlowPeerStatus {
 pub struct FlowLinkStatus {
     pub state: &'static str,
     pub attempt: u32,
-    pub max_attempts: u32,
     pub next_retry_ms: Option<u64>,
     pub rtt_ms: Option<u32>,
     pub last_error: Option<String>,
@@ -1772,7 +1768,6 @@ pub fn status(core: &Core) -> FlowStatus {
         })
         .collect();
     let now = Instant::now();
-    let backoff = link::Backoff::default();
     let state = core.input.lock();
     let flow = state.as_ref().ok().map(|s| &s.flow);
     let capture = flow
@@ -1816,8 +1811,6 @@ pub fn status(core: &Core) -> FlowStatus {
                             "connected"
                         } else if f.remote_closed.contains(id) {
                             "remote_closed"
-                        } else if link.gave_up {
-                            "gave_up"
                         } else if link.in_flight {
                             "reconnecting"
                         } else if link.next_at.is_some() {
@@ -1830,7 +1823,6 @@ pub fn status(core: &Core) -> FlowStatus {
                             FlowLinkStatus {
                                 state,
                                 attempt: link.attempt,
-                                max_attempts: backoff.max_attempts,
                                 next_retry_ms: link.retry_in(now).map(|d| d.as_millis() as u64),
                                 rtt_ms: rtt.filter(|_| connected),
                                 last_error: link.last_error,
@@ -1899,7 +1891,7 @@ fn arm(core: &Arc<Core>, peer: &str, config: FlowConfig, restoring: bool) -> Res
     if !connected && !restoring {
         return Err("Connect to this computer before turning on Flow.".into());
     }
-    if config.clipboard && !crate::network::clipboard_permitted(core, peer) {
+    if !restoring && config.clipboard && !crate::network::clipboard_permitted(core, peer) {
         return Err("To copy and paste between computers, turn on clipboard sharing in Settings and allow it for this computer.".into());
     }
     let mut state = core.input.lock().map_err(|_| "Input lock unavailable.")?;
@@ -1964,8 +1956,17 @@ fn save(core: &Core, peer: &str, config: FlowConfig) -> Result<(), String> {
     updated
         .flow_peers
         .retain(|f| f.peer != peer && f.edge != entry.edge);
+    let pref = &mut updated
+        .peers
+        .iter_mut()
+        .find(|p| p.peer.id == peer)
+        .ok_or("Unknown peer.")?
+        .peer
+        .flow_clipboard;
+    let changed = *pref != config.clipboard;
+    *pref = config.clipboard;
     updated.flow_peers.push(entry);
-    if updated.flow_peers == data.flow_peers {
+    if !changed && updated.flow_peers == data.flow_peers {
         return Ok(());
     }
     crate::storage::save(&core.directory, &updated)?;
@@ -1976,6 +1977,11 @@ fn save(core: &Core, peer: &str, config: FlowConfig) -> Result<(), String> {
 pub fn forget_saved(core: &Core, peer: &str) -> Result<(), String> {
     let mut data = core.data.lock().map_err(|_| "Settings lock unavailable.")?;
     let mut updated = data.clone();
+    if let Some(saved) = updated.flow_peers.iter().find(|entry| entry.peer == peer) {
+        if let Some(trusted) = updated.peers.iter_mut().find(|p| p.peer.id == peer) {
+            trusted.peer.flow_clipboard = saved.clipboard;
+        }
+    }
     if !updated.forget_flow(peer) {
         return Ok(());
     }
@@ -2120,6 +2126,32 @@ pub async fn set_flow(
     )
     .await
 }
+#[tauri::command]
+pub fn remember_flow_clipboard(
+    state: tauri::State<'_, Arc<Core>>,
+    peer_id: String,
+    enabled: bool,
+) -> Result<(), String> {
+    let mut data = state
+        .data
+        .lock()
+        .map_err(|_| "Settings lock unavailable.")?;
+    let mut updated = data.clone();
+    updated
+        .peers
+        .iter_mut()
+        .find(|p| p.peer.id == peer_id)
+        .ok_or("Unknown peer.")?
+        .peer
+        .flow_clipboard = enabled;
+    if let Some(saved) = updated.flow_peers.iter_mut().find(|f| f.peer == peer_id) {
+        saved.clipboard = enabled;
+    }
+    crate::storage::save(&state.directory, &updated)?;
+    *data = updated;
+    Ok(())
+}
+
 #[tauri::command]
 pub fn get_flow_status(state: tauri::State<'_, Arc<Core>>) -> FlowStatus {
     status(state.inner())
@@ -2269,14 +2301,31 @@ mod win {
             .filter(|(_, vk)| unsafe { GetAsyncKeyState(*vk) } as u16 & 0x8000 != 0)
             .map(|(id, _)| id)
     }
+    fn cursor_captured(layout: &Layout) -> bool {
+        let bounds = layout.virtual_bounds();
+        unsafe {
+            let mut clip = std::mem::zeroed();
+            let mut info: CURSORINFO = std::mem::zeroed();
+            info.cbSize = std::mem::size_of::<CURSORINFO>() as u32;
+            GetClipCursor(&mut clip) == 0
+                || clip.left > bounds.left
+                || clip.top > bounds.top
+                || clip.right <= bounds.right
+                || clip.bottom <= bounds.bottom
+                || GetCursorInfo(&mut info) == 0
+                || info.flags & CURSOR_SHOWING == 0
+        }
+    }
     pub fn begin_forwarding(session: uuid::Uuid, peer: &str, at: Instant) -> Result<bool, String> {
+        screen::win::dpi_aware();
         let unavailable = "Windows input capture is unavailable.";
         let anchor = {
             let guard = CTX.lock().map_err(|_| unavailable)?;
             let ctx = guard.as_ref().filter(|_| installed()).ok_or(unavailable)?;
-            if !ctx
-                .logic
-                .still_at_crossing(peer, at, &ctx.layout, screen::win::cursor())
+            if cursor_captured(&ctx.layout)
+                || !ctx
+                    .logic
+                    .still_at_crossing(peer, at, &ctx.layout, screen::win::cursor())
             {
                 return Ok(false);
             }
@@ -2343,6 +2392,25 @@ mod win {
         // while a callback is waiting for begin/end_forwarding's context lock.
         let forwarding = release_stale_capture(ctx);
         let HookCtx { logic, tx, layout } = ctx;
+        let event = match event {
+            RawEvent::Move { x, y, from } if forwarding => {
+                // The actual Windows cursor can drift from the parked point (DPI,
+                // a touchpad or an application warp). Forward only this report's delta.
+                let origin = from.unwrap_or(logic.anchor);
+                RawEvent::Move {
+                    x: logic.anchor.0.saturating_add(x.saturating_sub(origin.0)),
+                    y: logic.anchor.1.saturating_add(y.saturating_sub(origin.1)),
+                    from,
+                }
+            }
+            RawEvent::Move { .. } if cursor_captured(layout) => {
+                for arm in &mut logic.arms {
+                    arm.tracker.disarm_until_leave();
+                }
+                return false;
+            }
+            other => other,
+        };
         let (verdict, output) = logic.handle(event, injected, forwarding, layout, Instant::now());
         match output {
             Some(Captured::Move { dx, dy }) => {
@@ -3897,6 +3965,7 @@ mod tests {
         let mut data = core.data.lock().unwrap();
         data.peers.push(TrustedPeer {
             peer: Peer {
+                flow_clipboard: false,
                 id: id.clone(),
                 name: "Test peer".into(),
                 address: "127.0.0.1:48373".into(),
@@ -3939,8 +4008,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn turning_flow_off_removes_the_saved_choice() {
+    async fn turning_flow_off_preserves_clipboard_preference_without_rearming() {
         let (directory, core, id) = saved_fixture();
+        core.data.lock().unwrap().flow_peers[0].clipboard = true;
         let status = configure(
             &core,
             &id,
@@ -3956,6 +4026,7 @@ mod tests {
         assert!(status.saved.is_empty());
         let reloaded = crate::storage::load(directory.path(), "ignored".into()).unwrap();
         assert!(reloaded.flow_peers.is_empty());
+        assert!(reloaded.peers[0].peer.flow_clipboard);
     }
 
     #[test]

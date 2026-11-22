@@ -1,7 +1,8 @@
 use std::time::{Duration, Instant, SystemTime};
 
 pub const SCOPED_FLOW: u32 = 4;
-pub const PROTOCOL: u32 = SCOPED_FLOW;
+pub const RICH_CLIPBOARD: u32 = 5;
+pub const PROTOCOL: u32 = RICH_CLIPBOARD;
 pub const PROBING: u32 = 2;
 pub const PROBE_INTERVAL: Duration = Duration::from_secs(1);
 pub const TIE_BREAK: Duration = Duration::from_millis(1500);
@@ -11,14 +12,14 @@ pub const RESUME_GAP: Duration = Duration::from_secs(5);
 pub struct Backoff {
     pub base: Duration,
     pub cap: Duration,
-    pub max_attempts: u32,
+    pub fast_attempts: u32,
 }
 impl Default for Backoff {
     fn default() -> Self {
         Self {
             base: Duration::from_millis(500),
             cap: Duration::from_secs(15),
-            max_attempts: 10,
+            fast_attempts: 10,
         }
     }
 }
@@ -44,12 +45,11 @@ pub struct Reconnect {
     pub attempt: u32,
     pub next_at: Option<Instant>,
     pub in_flight: bool,
-    pub gave_up: bool,
     pub last_error: Option<String>,
 }
 impl Reconnect {
     pub fn idle(&self) -> bool {
-        self.next_at.is_none() && !self.in_flight && !self.gave_up
+        self.next_at.is_none() && !self.in_flight
     }
     pub fn lost(&mut self, backoff: &Backoff, now: Instant, jitter: f64, extra: Duration) {
         if self.idle() {
@@ -59,15 +59,14 @@ impl Reconnect {
     pub fn kick(&mut self, now: Instant, extra: Duration) {
         if !self.in_flight {
             self.attempt = 0;
-            self.gave_up = false;
             self.next_at = Some(now + extra);
         }
     }
     pub fn take_due(&mut self, now: Instant) -> bool {
-        if self.in_flight || self.gave_up || self.next_at.is_none_or(|at| now < at) {
+        if self.in_flight || self.next_at.is_none_or(|at| now < at) {
             return false;
         }
-        self.attempt += 1;
+        self.attempt = self.attempt.saturating_add(1);
         self.in_flight = true;
         self.next_at = None;
         true
@@ -75,9 +74,8 @@ impl Reconnect {
     pub fn failed(&mut self, backoff: &Backoff, now: Instant, jitter: f64, error: String) {
         self.in_flight = false;
         self.last_error = Some(error);
-        if self.attempt >= backoff.max_attempts {
-            self.gave_up = true;
-            self.next_at = None;
+        if self.attempt >= backoff.fast_attempts {
+            self.next_at = Some(now + Duration::from_secs(60));
         } else {
             self.next_at = Some(now + backoff.delay(self.attempt + 1, jitter));
         }
@@ -146,9 +144,9 @@ mod tests {
     }
 
     #[test]
-    fn reconnect_is_bounded_and_resets_on_success() {
+    fn reconnect_slows_down_while_offline_and_resets_on_success() {
         let backoff = Backoff {
-            max_attempts: 3,
+            fast_attempts: 3,
             ..Backoff::default()
         };
         let t0 = Instant::now();
@@ -169,8 +167,9 @@ mod tests {
                 assert!(link.take_due(now));
             }
         }
-        assert!(link.gave_up && link.next_at.is_none());
-        assert!(!link.take_due(now + Duration::from_secs(600)));
+        assert_eq!(link.retry_in(now), Some(Duration::from_secs(60)));
+        assert!(link.take_due(now + Duration::from_secs(60)));
+        link.failed(&backoff, now, 0.5, "offline".into());
         link.kick(now, Duration::ZERO);
         assert!(link.take_due(now) && link.attempt == 1);
         link.connected();

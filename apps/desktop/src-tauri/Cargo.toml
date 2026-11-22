@@ -1,6 +1,6 @@
 [package]
 name = "traplink"
-version = "0.1.10"
+version = "0.1.11"
 description = "Local-first desktop device and sharing companion"
 authors = ["TrapLink"]
 edition = "2021"
@@ -37,7 +37,7 @@ base64 = "0.22"
 rand = "0.8"
 keyring = { version = "3.6", features = ["apple-native", "windows-native"] }
 hidapi = { version = "2.6", default-features = false, features = ["windows-native", "macos-shared-device", "linux-native-basic-udev"] }
-arboard = { version = "3.6", default-features = false }
+arboard = { version = "3.7", features = ["image-data"] }
 local-ip-address = "0.6"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 url = "2"

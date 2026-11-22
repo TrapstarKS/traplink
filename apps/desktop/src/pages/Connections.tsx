@@ -237,6 +237,7 @@ const globalSwitch = { clipboard: "clipboardEnabled", files: "fileSharingEnabled
 
 function PeerDialog({ desktop, peer, onClose }: { desktop: Desktop; peer: ConnectedPeer; onClose: () => void }) {
   const opener = useRef<HTMLElement | null>(null);
+  const flowTab = useRef<HTMLButtonElement>(null);
   const [forgetting, setForgetting] = useState(false);
   const [saving, setSaving] = useState<PeerFeature | null>(null);
   const settings = desktop.snapshot?.settings;
@@ -245,6 +246,7 @@ function PeerDialog({ desktop, peer, onClose }: { desktop: Desktop; peer: Connec
   const returnSession = inputDirection && !connectingTo ? flowSession : null;
   const refresh = () => desktop.refresh(true);
   const supported: Record<PeerFeature, boolean> = { clipboard: desktop.capabilities.clipboardSharing, files: desktop.capabilities.fileSharing, input: desktop.capabilities.inputSharing };
+  const flowAvailable = supported.input && desktop.capabilities.flowEdgeSwitching !== false;
   const allowed = (key: PeerFeature) => !!peer.permissions?.[key] && !!settings?.[globalSwitch[key]];
   async function setPermission(key: PeerFeature, value: boolean) {
     setSaving(key);
@@ -259,7 +261,11 @@ function PeerDialog({ desktop, peer, onClose }: { desktop: Desktop; peer: Connec
     const done = await desktop.run(`forget-${peer.id}`, async () => { await nativeCommand("forget_peer", { id: peer.id }); return true; }, "Computer removed from authorized connections.");
     if (done) onClose();
   }
-  const descriptions: Record<PeerFeature, string> = { clipboard: "Send and receive copied text.", files: "Send and receive files.", input: `${peer.name} can control this computer.` };
+  const descriptions: Record<PeerFeature, string> = {
+    clipboard: `Allow this pair to send and receive copied text, images, and files with Send clipboard.${flowAvailable ? " For automatic transfers, turn on Share clipboard on switch in Flow." : ""}`,
+    files: "Send and receive files.",
+    input: `${peer.name} can control this computer.`,
+  };
   return <><Dialog open onOpenChange={value => { if (!value) onClose(); }}><DialogContent className="peer-dialog"
     onOpenAutoFocus={() => { opener.current = document.activeElement instanceof HTMLElement ? document.activeElement : null; }}
     onCloseAutoFocus={event => { event.preventDefault(); if (opener.current?.isConnected) opener.current.focus(); else document.getElementById("main-content")?.focus(); }}>
@@ -268,10 +274,10 @@ function PeerDialog({ desktop, peer, onClose }: { desktop: Desktop; peer: Connec
       <div className="peer-dialog-identity"><DialogTitle>{peer.name}</DialogTitle><DialogDescription><PlatformName platform={peer.platform} /> · {peer.address}</DialogDescription></div>
       <StatusBadge active={peer.connected}>{inputDirection ?? (peer.connected ? "Connected" : "Disconnected")}</StatusBadge>
     </DialogHeader>
-    <Tabs defaultValue="flow" className="peer-tabs">
-      <TabsList className="full-tabs" aria-label="Computer settings"><TabsTrigger value="flow">Flow</TabsTrigger><TabsTrigger value="permissions">Permissions</TabsTrigger><TabsTrigger value="details">Details</TabsTrigger></TabsList>
+    <Tabs defaultValue="flow" activationMode="automatic" className="peer-tabs">
+      <TabsList className="full-tabs" aria-label="Computer settings"><TabsTrigger value="flow" ref={flowTab}>Flow</TabsTrigger><TabsTrigger value="permissions">Permissions</TabsTrigger><TabsTrigger value="details">Details</TabsTrigger></TabsList>
       <TabsContent value="flow" className="peer-tab-content">
-        <FlowControl peer={peer} peers={desktop.snapshot?.peers ?? []} available={desktop.capabilities.inputSharing && desktop.capabilities.flowEdgeSwitching !== false} startOnLogin={!!settings?.startOnLogin} onPermissionsChanged={refresh} />
+        <FlowControl peer={peer} peers={desktop.snapshot?.peers ?? []} available={flowAvailable} clipboardSupported={supported.clipboard} clipboardAllowed={allowed("clipboard")} startOnLogin={!!settings?.startOnLogin} onPermissionsChanged={refresh} />
         <Separator />
         <Disclosure label="Manual control" icon={Keyboard}>
           <InputControl peer={peer} enabled={desktop.native && desktop.capabilities.inputSharing} onPermissionsChanged={refresh} />
@@ -282,7 +288,15 @@ function PeerDialog({ desktop, peer, onClose }: { desktop: Desktop; peer: Connec
           <h3>What this computer allows</h3>
           <p className="input-control-note">Choose what to share with {peer.name}. The other computer must allow sharing too.</p>
           <FieldGroup className="permission-fields">
-            {(["clipboard", "files", "input"] as const).map(key => <Field key={key} orientation="horizontal" data-disabled={!desktop.native || !supported[key]}><FieldContent><FieldLabel htmlFor={`peer-${key}`}>{permissionCopy[key].label}</FieldLabel><FieldDescription id={`peer-${key}-help`}>{supported[key] ? descriptions[key] : "Not supported on this computer."}</FieldDescription></FieldContent>{saving === key ? <Spinner aria-label={`Saving ${permissionCopy[key].label.toLowerCase()} permission`} /> : null}<Switch id={`peer-${key}`} aria-describedby={`peer-${key}-help`} checked={allowed(key)} disabled={!desktop.native || !supported[key] || saving !== null} onCheckedChange={value => void setPermission(key, value)} /></Field>)}
+            {(["clipboard", "files", "input"] as const).map(key => <Field key={key} orientation="horizontal" data-disabled={!desktop.native || !supported[key]}>
+              <FieldContent>
+                <FieldLabel htmlFor={`peer-${key}`}>{permissionCopy[key].label}</FieldLabel>
+                <FieldDescription id={`peer-${key}-help`}>{supported[key] ? descriptions[key] : "Not supported on this computer."}</FieldDescription>
+                {key === "clipboard" && supported.clipboard && flowAvailable ? <Button type="button" variant="link" size="sm" className="self-start px-0" onClick={() => flowTab.current?.focus()}>Open Flow settings<ArrowRight data-icon="inline-end" /></Button> : null}
+              </FieldContent>
+              {saving === key ? <Spinner aria-label={`Saving ${permissionCopy[key].label.toLowerCase()} permission`} /> : null}
+              <Switch id={`peer-${key}`} aria-describedby={`peer-${key}-help`} checked={allowed(key)} disabled={!desktop.native || !supported[key] || saving !== null} onCheckedChange={value => void setPermission(key, value)} />
+            </Field>)}
           </FieldGroup>
         </section>
       </TabsContent>

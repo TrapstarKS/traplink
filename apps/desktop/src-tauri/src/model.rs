@@ -173,6 +173,8 @@ pub enum FlowMode {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Peer {
+    #[serde(default)]
+    pub flow_clipboard: bool,
     pub id: String,
     pub name: String,
     pub address: String,

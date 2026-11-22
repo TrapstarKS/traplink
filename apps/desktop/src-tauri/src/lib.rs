@@ -1,5 +1,6 @@
 mod auth;
 mod background;
+mod clipboard;
 mod cloud_backup;
 mod consent;
 mod devices;
@@ -130,8 +131,7 @@ async fn update_settings(
         let changed = (
             data.settings.port != settings.port,
             data.settings.auth_server_url != settings.auth_server_url,
-            (data.settings.input_enabled && !settings.input_enabled)
-                || (data.settings.clipboard_enabled && !settings.clipboard_enabled),
+            data.settings.input_enabled && !settings.input_enabled,
             !data.settings.input_enabled && settings.input_enabled,
         );
         let mut updated = data.clone();
@@ -403,8 +403,6 @@ fn set_peer_permissions(
         files,
         input: input.unwrap_or(false),
     };
-    let revoked = (peer.peer.permissions.input && !next.input)
-        || (peer.peer.permissions.clipboard && !next.clipboard);
     let input_revoked = peer.peer.permissions.input && !next.input;
     peer.peer.permissions = next;
     if input_revoked {
@@ -413,7 +411,7 @@ fn set_peer_permissions(
     storage::save(&state.directory, &updated)?;
     *data = updated;
     drop(data);
-    if revoked {
+    if input_revoked {
         let active = input::stop_peer(&state, &id);
         if let Ok(link) = network::session(&state, &id) {
             link.notify_input_stop(active);
@@ -752,6 +750,7 @@ pub fn run() {
             release_flow_control,
             flow::set_flow,
             flow::get_flow_status,
+            flow::remember_flow_clipboard,
             flow::repair_flow,
             remap::get_remap_status,
             remap::set_remap_enabled,

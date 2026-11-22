@@ -217,6 +217,7 @@ mod tests {
         for id in ["a", "b", "c"] {
             data.peers.push(TrustedPeer {
                 peer: Peer {
+                    flow_clipboard: false,
                     id: id.into(),
                     name: id.into(),
                     address: String::new(),

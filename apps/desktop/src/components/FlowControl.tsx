@@ -18,8 +18,8 @@ import { allowLocally, askPeerForInput, macPermissionPanes, type MacPane } from 
 export type FlowEdge = "left" | "right" | "top" | "bottom";
 export type FlowMode = "edge" | "ctrl_edge";
 export interface FlowPeerStatus { edge: FlowEdge; mode: FlowMode; delayMs: number; blockWhileButton: boolean; clipboard: boolean }
-export type FlowLinkState = "connected" | "reconnecting" | "waiting" | "gave_up" | "remote_closed" | "offline";
-export interface FlowLinkStatus { state: FlowLinkState; attempt: number; maxAttempts: number; nextRetryMs?: number | null; rttMs?: number | null; lastError?: string | null }
+export type FlowLinkState = "connected" | "reconnecting" | "waiting" | "remote_closed" | "offline";
+export interface FlowLinkStatus { state: FlowLinkState; attempt: number; nextRetryMs?: number | null; rttMs?: number | null; lastError?: string | null }
 export interface FlowCaptureStatus { installed: boolean; reinstalls: number; lastReinstallAgoMs?: number | null; reason?: "removed" | "repair" | null }
 export interface FlowError { code: string; peer?: string | null; detail: string }
 interface FlowTiming { peer: string; elapsedMs: number }
@@ -45,10 +45,9 @@ const RECENT_REINSTALL_MS = 15000;
 
 export function flowStatusLine(peerName: string, connected: boolean, active: boolean, controlling: boolean, switching: boolean, link?: FlowLinkStatus, capture?: FlowCaptureStatus | null): { label: string; variant: "default" | "secondary" | "destructive" | "outline"; busy?: boolean } {
   if (!active) return { label: "Off", variant: "outline" };
-  if (link?.state === "gave_up") return { label: "No connection", variant: "destructive" };
   if (link?.state === "remote_closed") return { label: "Disconnected by the other computer", variant: "outline" };
-  if (link?.state === "reconnecting") return { label: `Reconnecting (${link.attempt} of ${link.maxAttempts})`, variant: "secondary", busy: true };
-  if (link?.state === "waiting") return { label: `Retry ${link.attempt + 1} of ${link.maxAttempts} in ${Math.max(1, Math.ceil((link.nextRetryMs ?? 0) / 1000))} s`, variant: "secondary" };
+  if (link?.state === "reconnecting") return { label: `Reconnecting (${link.attempt})`, variant: "secondary", busy: true };
+  if (link?.state === "waiting") return { label: `Retry ${link.attempt + 1} in ${Math.max(1, Math.ceil((link.nextRetryMs ?? 0) / 1000))} s`, variant: "secondary" };
   if (link ? link.state !== "connected" : !connected) return { label: "Other computer disconnected", variant: "outline" };
   if (controlling) return { label: `Controlling ${peerName}`, variant: "default" };
   if (switching) return { label: "Switching…", variant: "secondary", busy: true };
@@ -66,9 +65,9 @@ const edges = [
 ] as const;
 const delays = [0, 150, 250, 500, 1000];
 
-export function FlowControl({ peer, peers, available, startOnLogin, onPermissionsChanged }: { peer: ConnectedPeer; peers: ConnectedPeer[]; available: boolean; startOnLogin: boolean; onPermissionsChanged: () => Promise<void> }) {
+export function FlowControl({ peer, peers, available, clipboardSupported, clipboardAllowed, startOnLogin, onPermissionsChanged }: { peer: ConnectedPeer; peers: ConnectedPeer[]; available: boolean; clipboardSupported: boolean; clipboardAllowed: boolean; startOnLogin: boolean; onPermissionsChanged: () => Promise<void> }) {
   const [status, setStatus] = useState<FlowStatus | null>(null);
-  const [draft, setDraft] = useState<FlowPeerStatus>(defaults);
+  const [draft, setDraft] = useState<FlowPeerStatus>(() => ({ ...defaults, clipboard: peer.flowClipboard ?? false }));
   const [saving, setSaving] = useState(false);
   const [waiting, setWaiting] = useState(false);
   const [macPanes, setMacPanes] = useState<MacPane[] | null>(null);
@@ -159,7 +158,15 @@ export function FlowControl({ peer, peers, available, startOnLogin, onPermission
     const next = { ...draft, ...patch };
     setDraft(next);
     setActionError(null);
-    if (!active) return;
+    if (!active) {
+      if (patch.clipboard === undefined || !beginOperation()) return;
+      try {
+        await nativeCommand("remember_flow_clipboard", { peerId: peer.id, enabled: patch.clipboard });
+        await onPermissionsChanged();
+      } catch (error) { setDraft(draft); fail(error); }
+      finally { finishOperation(); }
+      return;
+    }
     if (!beginOperation()) return;
     try {
       if (patch.clipboard) { await allowLocally(peer.id, ["clipboard"]); await onPermissionsChanged(); }
@@ -211,7 +218,7 @@ export function FlowControl({ peer, peers, available, startOnLogin, onPermission
   const route = draft.mode === "ctrl_edge" ? `Hold ${modifier} and push past the ${draft.edge} edge.`
     : draft.delayMs === 0 ? `Push past the ${draft.edge} edge to switch.`
     : `Keep pushing at the ${draft.edge} edge for ${draft.delayMs} ms to switch.`;
-  const connectionNeedsHelp = link?.state === "gave_up" || link?.state === "remote_closed" || link?.state === "offline";
+  const connectionNeedsHelp = link?.state === "remote_closed" || link?.state === "offline";
   const liveStatus = waiting ? `Waiting for permission on ${peer.name}.` : readError ? "Flow status could not be checked." : link?.state === "reconnecting" || link?.state === "waiting" ? `Reconnecting to ${peer.name}.` : `${peer.name}. Flow ${line.label}.`;
   const guidance = waiting ? `Accept the mouse and keyboard request on ${peer.name}.`
     : readError ? "Check the status again to change Flow settings."
@@ -249,6 +256,20 @@ export function FlowControl({ peer, peers, available, startOnLogin, onPermission
     {readError ? <Alert variant="destructive"><AlertTitle>Couldn't check Flow</AlertTitle><AlertDescription className="flex flex-col gap-3"><span>{readError}</span><Button variant="outline" size="sm" onClick={() => void refresh()}><RefreshCw data-icon="inline-start" />Check again</Button></AlertDescription></Alert> : null}
     {actionError ? <Alert variant="destructive"><AlertTitle>Couldn't apply this change</AlertTitle><AlertDescription>{actionError}</AlertDescription></Alert> : null}
     {error && explained && !actionError ? <Alert variant={error.code === "hook_removed" ? "default" : "destructive"}><AlertTitle>{explained.title}</AlertTitle><AlertDescription>{explained.body}</AlertDescription></Alert> : null}
+    <Field orientation="horizontal" data-disabled={controlsDisabled || !clipboardSupported}>
+      <FieldContent>
+        <FieldLabel htmlFor={`flow-clipboard-${peer.id}`}>Share clipboard on switch</FieldLabel>
+        <FieldDescription id={`flow-clipboard-help-${peer.id}`}>
+          {clipboardSupported ? <>
+            Transfer copied text, images, or files when you switch to {peer.name} or return here.{" "}
+            {active && draft.clipboard && !clipboardAllowed ? "Allow Clipboard in Permissions on this computer to resume transfers."
+              : `Allow Clipboard on ${peer.name}. Copied files also need Files permission on both computers.`}
+            {!active ? " This choice applies when you turn Flow on." : null}
+          </> : "Clipboard sharing isn't supported on this computer."}
+        </FieldDescription>
+      </FieldContent>
+      <Switch id={`flow-clipboard-${peer.id}`} aria-describedby={`flow-clipboard-help-${peer.id}`} checked={draft.clipboard} disabled={controlsDisabled || !clipboardSupported} onCheckedChange={value => void change({ clipboard: value })} />
+    </Field>
     <FieldGroup className="flow-settings">
       <Field data-disabled={controlsDisabled}>
         <FieldTitle id={`flow-edge-label-${peer.id}`}>Edge of this screen</FieldTitle>
@@ -278,10 +299,9 @@ export function FlowControl({ peer, peers, available, startOnLogin, onPermission
         <FieldDescription id={`flow-delay-help-${peer.id}`}>{draft.mode === "ctrl_edge" ? `Holding ${modifier} switches immediately.` : "A short delay helps prevent accidental switches."}</FieldDescription>
       </Field>
     </FieldGroup>
-    <Disclosure label="Sharing and behavior" icon={SlidersHorizontal}>
+    <Disclosure label="More Flow settings" icon={SlidersHorizontal}>
       <FieldGroup>
         <Field orientation="horizontal" data-disabled={controlsDisabled}><FieldContent><FieldLabel htmlFor={`flow-button-${peer.id}`}>Don't switch while dragging</FieldLabel><FieldDescription>Stay on this computer while a mouse button is held.</FieldDescription></FieldContent><Switch id={`flow-button-${peer.id}`} checked={draft.blockWhileButton} disabled={controlsDisabled} onCheckedChange={value => void change({ blockWhileButton: value })} /></Field>
-        <Field orientation="horizontal" data-disabled={controlsDisabled}><FieldContent><FieldLabel htmlFor={`flow-clipboard-${peer.id}`}>Copy and paste between computers</FieldLabel><FieldDescription>Send copied text when switching, up to 24 KiB. Requires clipboard permission on both computers.</FieldDescription></FieldContent><Switch id={`flow-clipboard-${peer.id}`} checked={draft.clipboard} disabled={controlsDisabled} onCheckedChange={value => void change({ clipboard: value })} /></Field>
       </FieldGroup>
       {isMac ? <p className="input-control-note">On Mac, ⌘ Command reaches the other computer as Ctrl, and Control as the Windows key.</p> : null}
       <p className="input-control-note">{active ? "Changes apply immediately. Flow keeps running when this window closes." : "Your choices apply when you turn Flow on."} {startOnLogin ? "TrapLink starts with this computer." : "Enable “Start with computer” in Preferences to resume after signing in."}</p>
