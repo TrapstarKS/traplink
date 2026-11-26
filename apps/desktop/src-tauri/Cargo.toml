@@ -1,6 +1,6 @@
 [package]
 name = "traplink"
-version = "0.1.11"
+version = "0.1.12"
 description = "Local-first desktop device and sharing companion"
 authors = ["TrapLink"]
 edition = "2021"

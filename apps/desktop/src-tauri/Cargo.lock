@@ -5570,7 +5570,7 @@ dependencies = [
 
 [[package]]
 name = "traplink"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "arboard",
  "argon2",
