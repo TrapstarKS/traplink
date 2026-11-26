@@ -10,7 +10,7 @@ import { Input } from "@/components/ui/input";
 import { Item, ItemActions, ItemContent, ItemDescription, ItemGroup, ItemMedia, ItemSeparator, ItemTitle } from "@/components/ui/item";
 import { BusyIcon, ConfirmDialog, EmptyState, formattedDate, IconButton, PageHeading, relativeDate, SecurityNote } from "@/components/common";
 import type { Intent } from "@/App";
-import { chooseBackupDestination, chooseFile, nativeCommand, type Backup } from "@/lib/bridge";
+import { chooseFile, nativeCommand, saveBackupFile, type Backup } from "@/lib/bridge";
 import type { Desktop } from "@/lib/use-desktop";
 
 type BackupAction = { backup: Backup; kind: "restore" | "delete" };
@@ -37,11 +37,9 @@ export function Backups({ desktop, onAccount, intent, onIntentDone }: { desktop:
     if (result) setAction(null);
   }
   async function exportBackup(backup: Backup) {
-    await desktop.run(`export-${backup.id}`, async () => {
-      const path = await chooseBackupDestination(backup.name);
-      if (path) { await nativeCommand("export_backup_file", { id: backup.id, path }); return true; }
-      return false;
-    }).then(result => { if (result) toast.success("Backup exported."); });
+    // The native save dialog already asked before replacing an existing file.
+    await desktop.run(`export-${backup.id}`, () => saveBackupFile(backup.id, backup.name))
+      .then(result => { if (result) toast.success("Backup exported."); });
   }
   async function importBackup() {
     const result = await desktop.run("import-backup", async () => {

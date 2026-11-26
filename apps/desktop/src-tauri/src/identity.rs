@@ -92,6 +92,7 @@ pub fn save_credential(installation: &str, value: &Credential) -> Result<(), Str
         .set_password(&serde_json::to_string(value).map_err(|e| e.to_string())?)
         .map_err(|e| format!("Cannot save account in OS credential store: {e}"))
 }
+#[cfg(not(test))]
 pub fn delete_credential(installation: &str) -> Result<(), String> {
     let entry = keyring::Entry::new(SERVICE, &format!("{installation}:account"))
         .map_err(|e| e.to_string())?;
@@ -101,4 +102,22 @@ pub fn delete_credential(installation: &str) -> Result<(), String> {
             "Cannot remove account from OS credential store: {e}"
         )),
     }
+}
+
+/// Tests never touch the OS keychain: deletions are only recorded.
+#[cfg(test)]
+static DELETED_CREDENTIALS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+#[cfg(test)]
+pub fn delete_credential(installation: &str) -> Result<(), String> {
+    DELETED_CREDENTIALS
+        .lock()
+        .map_err(|_| "Test credential store unavailable.")?
+        .push(installation.to_owned());
+    Ok(())
+}
+#[cfg(test)]
+pub fn credential_was_deleted(installation: &str) -> bool {
+    DELETED_CREDENTIALS
+        .lock()
+        .is_ok_and(|deleted| deleted.iter().any(|value| value == installation))
 }

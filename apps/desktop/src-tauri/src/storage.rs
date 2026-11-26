@@ -54,6 +54,13 @@ pub fn sanitize_flow(data: &mut Persisted) {
     });
 }
 pub fn write_document<T: Serialize>(path: &Path, data: &T) -> Result<(), String> {
+    staged_document(path, data)?
+        .persist(path)
+        .map_err(|e| format!("Cannot replace document: {}", e.error))?;
+    Ok(())
+}
+/// Writes `data` to a synced temporary file next to `path`, ready to be moved into place.
+fn staged_document<T: Serialize>(path: &Path, data: &T) -> Result<tempfile::NamedTempFile, String> {
     let serialized =
         serde_json::to_vec_pretty(data).map_err(|e| format!("Cannot serialize document: {e}"))?;
     if serialized.len() as u64 > MAX_DOCUMENT {
@@ -68,9 +75,7 @@ pub fn write_document<T: Serialize>(path: &Path, data: &T) -> Result<(), String>
     file.flush()
         .and_then(|_| file.as_file().sync_all())
         .map_err(|e| format!("Cannot save document: {e}"))?;
-    file.persist(path)
-        .map_err(|e| format!("Cannot replace document: {}", e.error))?;
-    Ok(())
+    Ok(file)
 }
 pub fn read_document<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, String> {
     let file = fs::File::open(path).map_err(|e| format!("Cannot read document: {e}"))?;
@@ -91,6 +96,42 @@ pub fn read_document<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, S
 }
 pub fn save(directory: &Path, data: &Persisted) -> Result<(), String> {
     write_document(&directory.join("settings.json"), data)
+}
+/// Writes a saved backup to `destination` atomically. `replace` is set only when the user
+/// picked the path in the native save dialog, which already asked before replacing a file.
+pub fn export_backup(
+    directory: &Path,
+    id: &str,
+    destination: &Path,
+    replace: bool,
+) -> Result<(), String> {
+    let doc: BackupDocument = read_document(&backup_path(directory, id)?)?;
+    doc.validate()?;
+    if replace {
+        return write_document(destination, &doc);
+    }
+    staged_document(destination, &doc)?
+        .persist_noclobber(destination)
+        .map_err(|e| format!("Cannot export backup (choose a new filename): {}", e.error))?;
+    Ok(())
+}
+
+/// The native error shown when TrapLink cannot start. When settings.json exists it is the
+/// likely cause (damaged, or from a newer version) and is never changed or deleted. Otherwise
+/// the data folder itself could not be created or written, so there is no file to fix.
+pub fn startup_failure_message(error: &str, directory: &Path) -> String {
+    let path = directory.join("settings.json");
+    if path.is_file() {
+        format!(
+            "TrapLink could not open its settings.\n\n{error}\n\nSettings file: {}\n\nThe file has not been changed. Fix it, or move it elsewhere to start with default settings.",
+            path.display()
+        )
+    } else {
+        format!(
+            "TrapLink cannot use its data folder.\n\n{error}\n\nData folder: {}\n\nMake sure this folder can be created and written to, then start TrapLink again.",
+            directory.display()
+        )
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -179,6 +220,98 @@ mod tests {
         assert!(!encoded.contains("peers"));
         assert!(!encoded.contains("deviceToken"));
         assert!(backup_path(directory.path(), "../../escape").is_err());
+    }
+    fn saved_backup(directory: &Path, name: &str) -> String {
+        let data = load(directory, directory.display().to_string()).unwrap();
+        let doc = BackupDocument {
+            format: "traplink-backup".into(),
+            version: 1,
+            backup: Backup {
+                id: Uuid::new_v4().to_string(),
+                name: name.into(),
+                created_at: now(),
+                profile_count: 0,
+            },
+            settings: data.settings,
+            profiles: vec![],
+        };
+        write_document(&backup_path(directory, &doc.backup.id).unwrap(), &doc).unwrap();
+        doc.backup.id
+    }
+    #[test]
+    fn export_replaces_a_file_confirmed_in_the_save_dialog() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("Work setup.json");
+        let first = saved_backup(directory.path(), "First");
+        export_backup(directory.path(), &first, &destination, true).unwrap();
+        let second = saved_backup(directory.path(), "Second");
+        export_backup(directory.path(), &second, &destination, true).unwrap();
+        let exported: BackupDocument = read_document(&destination).unwrap();
+        exported.validate().unwrap();
+        assert_eq!(exported.backup.id, second);
+        assert_eq!(exported.backup.name, "Second");
+    }
+    #[test]
+    fn legacy_export_still_refuses_to_replace_and_keeps_the_existing_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("existing.json");
+        fs::write(&destination, b"keep me").unwrap();
+        let id = saved_backup(directory.path(), "Backup");
+        assert!(export_backup(directory.path(), &id, &destination, false).is_err());
+        assert_eq!(fs::read(&destination).unwrap(), b"keep me");
+        let leftovers = fs::read_dir(directory.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().is_file())
+            .count();
+        assert_eq!(
+            leftovers, 2,
+            "only settings.json and the existing file remain"
+        );
+    }
+    fn settings_json(directory: &Path, schema: u32, device_name: &str) -> String {
+        let downloads = serde_json::to_string(&directory.display().to_string()).unwrap();
+        let name = serde_json::to_string(device_name).unwrap();
+        format!(
+            r#"{{"schemaVersion":{schema},"deviceId":"{}","settings":{{"deviceName":{name},"authServerUrl":"https://traplink.traphub.xyz","clipboardEnabled":false,"fileSharingEnabled":false,"inputEnabled":false,"startOnLogin":false,"theme":"dark","downloadDirectory":{downloads},"port":48372}},"profiles":[],"peers":[]}}"#,
+            Uuid::new_v4()
+        )
+    }
+    #[test]
+    fn startup_errors_name_the_settings_file_and_leave_it_unchanged() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        for contents in [settings_json(directory.path(), 2, "PC"), "{".to_string()] {
+            fs::write(&path, &contents).unwrap();
+            let error = load(directory.path(), "ignored".into()).err().unwrap();
+            let message = startup_failure_message(&error, directory.path());
+            assert!(message.contains(&error));
+            assert!(message.contains(&path.display().to_string()), "{message}");
+            assert!(message.contains("has not been changed"));
+            assert_eq!(fs::read_to_string(&path).unwrap(), contents);
+        }
+    }
+    #[test]
+    fn startup_errors_without_a_settings_file_name_the_data_folder() {
+        let parent = tempfile::tempdir().unwrap();
+        // A file where the data folder should be makes create_dir_all fail.
+        let directory = parent.path().join("TrapLink");
+        fs::write(&directory, b"not a folder").unwrap();
+        let error = load(&directory, "ignored".into()).err().unwrap();
+        let message = startup_failure_message(&error, &directory);
+        assert!(message.contains(&error));
+        assert!(message.contains("data folder"), "{message}");
+        assert!(message.contains(&directory.display().to_string()), "{message}");
+        assert!(!message.contains("settings.json"), "{message}");
+        assert!(!message.contains("has not been changed"), "{message}");
+    }
+    #[test]
+    fn stored_device_names_with_control_characters_still_load() {
+        let directory = tempfile::tempdir().unwrap();
+        let json = settings_json(directory.path(), 1, "Work\tPC");
+        fs::write(directory.path().join("settings.json"), json).unwrap();
+        let data = load(directory.path(), "ignored".into()).unwrap();
+        assert_eq!(data.settings.device_name, "Work\tPC");
     }
     #[test]
     fn start_on_login_is_allowed_but_remote_http_is_not() {

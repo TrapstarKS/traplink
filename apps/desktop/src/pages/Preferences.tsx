@@ -17,6 +17,7 @@ import { chooseDirectory, messageFrom, nativeCommand, type DesktopSnapshot, type
 import { mergeSettingsDraft } from "@/lib/settings";
 import type { Desktop } from "@/lib/use-desktop";
 import { useUpdater } from "@/lib/updater";
+import { deviceNameValid, maxDeviceNameLength } from "@/lib/device-name";
 
 const defaultSettings: Settings = { deviceName: "", authServerUrl: "", clipboardEnabled: false, fileSharingEnabled: false, inputEnabled: false, startOnLogin: false, theme: "dark", downloadDirectory: "", port: 48372 };
 
@@ -35,7 +36,8 @@ export function Preferences({ desktop }: { desktop: Desktop }) {
   async function openPane(pane: "accessibility" | "input_monitoring") {
     try { await nativeCommand("open_privacy_settings", { pane }); } catch (error) { toast.error(messageFrom(error)); }
   }
-  const valid = !!draft.deviceName.trim() && draft.deviceName.trim().length <= 80 && Number.isInteger(draft.port) && draft.port >= 1024 && draft.port <= 65535 && !!draft.authServerUrl.trim() && !!draft.downloadDirectory.trim();
+  const deviceNameOk = draft.deviceName === initial.deviceName || deviceNameValid(draft.deviceName);
+  const valid = deviceNameOk && Number.isInteger(draft.port) && draft.port >= 1024 && draft.port <= 65535 && !!draft.authServerUrl.trim() && !!draft.downloadDirectory.trim();
 
   useEffect(() => {
     if (!dirty || draftJson === initialJson) {
@@ -72,7 +74,7 @@ export function Preferences({ desktop }: { desktop: Desktop }) {
         <TabsList className="preference-tabs"><TabsTrigger value="general">General</TabsTrigger><TabsTrigger value="sharing">Sharing</TabsTrigger><TabsTrigger value="permissions">Permissions</TabsTrigger><TabsTrigger value="updates">Updates</TabsTrigger></TabsList>
         <TabsContent value="general"><div className="settings-stack">
           <Card className="settings-panel"><CardHeader><CardTitle>This computer</CardTitle><CardDescription>App identity and appearance.</CardDescription></CardHeader><CardContent><FieldGroup>
-            <Field data-disabled={disabled}><FieldLabel htmlFor="device-name">Computer name</FieldLabel><Input id="device-name" value={draft.deviceName} onChange={event => update("deviceName", event.target.value)} disabled={disabled} placeholder={desktop.native ? "My computer" : "Available in the desktop app"} maxLength={80} required /></Field>
+            <Field data-disabled={disabled}><FieldLabel htmlFor="device-name">Computer name</FieldLabel><Input id="device-name" value={draft.deviceName} onChange={event => update("deviceName", event.target.value)} disabled={disabled} placeholder={desktop.native ? "My computer" : "Available in the desktop app"} aria-invalid={!deviceNameOk} aria-describedby="device-name-hint" required /><FieldDescription id="device-name-hint">{deviceNameOk ? "Shown to your other computers and in your account." : `Use 1 to ${maxDeviceNameLength} characters without tabs or line breaks.`}</FieldDescription></Field>
             <Field data-disabled={disabled}><FieldLabel htmlFor="appearance">Appearance</FieldLabel><Select value={draft.theme} onValueChange={value => update("theme", value as Settings["theme"])} disabled={disabled}><SelectTrigger id="appearance"><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="dark"><span className="select-with-icon"><Moon />Dark</span></SelectItem><SelectItem value="light"><span className="select-with-icon"><Sun />Light</span></SelectItem><SelectItem value="system"><span className="select-with-icon"><Laptop />Use system setting</span></SelectItem></SelectGroup></SelectContent></Select></Field>
             <Field orientation="horizontal" data-disabled={!desktop.capabilities.startOnLogin || disabled}><FieldContent><FieldLabel htmlFor="start-on-login">Start at login</FieldLabel><FieldDescription>Opens TrapLink in the system tray at sign-in without showing the window, so remapping works without opening the app. While on, closing the window keeps TrapLink in the tray; use Quit in the tray menu to exit.</FieldDescription></FieldContent><Switch id="start-on-login" checked={draft.startOnLogin} disabled={!desktop.capabilities.startOnLogin || disabled} onCheckedChange={value => update("startOnLogin", value)} /></Field>
           </FieldGroup></CardContent></Card>
