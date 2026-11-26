@@ -445,6 +445,29 @@ pub fn scan_code(scan: u32, extended: bool) -> Option<&'static str> {
 pub fn key_id(scan: u32, extended: bool) -> u32 {
     scan | (u32::from(extended) << 8)
 }
+/// Scan code of a Windows low-level keyboard event. Codes above 0xFF are
+/// synthetic, such as the fake left Ctrl (0x21D) that Windows sends with
+/// AltGr. They stay at 0x200 and above, so they never become a real key id
+/// and are never sent, but they are still tracked like any other key.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub fn ll_scan(scan_code: u32) -> u32 {
+    if scan_code > 0xFF {
+        0x200 | (scan_code & 0xFF)
+    } else {
+        scan_code
+    }
+}
+/// Button index of a Windows X button event: XBUTTON1 (back) is 3 and
+/// XBUTTON2 (forward) is 4, so each keeps its own pressed state.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub fn x_button_index(mouse_data: u32) -> u8 {
+    const XBUTTON2: u16 = 0x0002;
+    if (mouse_data >> 16) as u16 == XBUTTON2 {
+        4
+    } else {
+        3
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum RawEvent {
@@ -587,6 +610,46 @@ impl CaptureLogic {
         for id in ids {
             self.keys.adopt_local(id);
         }
+    }
+    /// Whether the tracked modifiers decide this event, so they should first
+    /// be checked against the system: Esc with Ctrl and Alt (the emergency
+    /// stop), or a local move while Ctrl is held and a Ctrl edge is armed.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub fn needs_modifier_sync(&self, event: &RawEvent, forwarding: bool) -> bool {
+        match *event {
+            RawEvent::Key {
+                scan: 0x01,
+                extended: false,
+                down: true,
+            } => self.ctrl() && self.alt(),
+            RawEvent::Move { .. } if !forwarding => {
+                self.ctrl()
+                    && self
+                        .arms
+                        .iter()
+                        .any(|arm| arm.tracker.config.mode == FlowMode::CtrlEdge)
+            }
+            _ => false,
+        }
+    }
+    /// Drops modifiers that were passed to the local system but that it no
+    /// longer reports down, because their release went to another desktop.
+    /// Modifiers owned by the remote are kept: the local system never saw them.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub fn sync_local_modifiers(&mut self, down: impl Fn(u32) -> bool) {
+        for id in MODIFIER_IDS {
+            if self.keys.held(id) && !down(id) {
+                self.keys.forget_local(id);
+            }
+        }
+    }
+    /// The input desktop changed (secure desktop, lock or UAC). Releases made
+    /// there never reach the hook, so local presses are forgotten. A key that
+    /// is still held comes back with its next auto-repeat.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub fn forget_local_input(&mut self) {
+        self.keys.forget_all_local();
+        self.buttons.forget_all_local();
     }
     fn key_event(&self, id: u32, down: bool) -> Option<InputEvent> {
         if id >= 0x200 {
@@ -2199,8 +2262,8 @@ mod platform {
 #[cfg(target_os = "windows")]
 mod win {
     use super::{
-        Bounds, CaptureLogic, CaptureStatus, Captured, FlowEdge, HookHealth, RawEvent, Verdict,
-        EDGE_INSET_PX,
+        ll_scan, x_button_index, Bounds, CaptureLogic, CaptureStatus, Captured, FlowEdge,
+        HookHealth, RawEvent, Verdict, EDGE_INSET_PX,
     };
     use crate::screen::{self, Layout};
     use std::{
@@ -2212,9 +2275,12 @@ mod win {
     };
     use tokio::sync::mpsc::UnboundedSender;
     use windows_sys::Win32::{
-        Foundation::{LPARAM, LRESULT, WPARAM},
+        Foundation::{HWND, LPARAM, LRESULT, WPARAM},
         System::{LibraryLoader::GetModuleHandleW, Threading::GetCurrentThreadId},
-        UI::WindowsAndMessaging::*,
+        UI::{
+            Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK},
+            WindowsAndMessaging::*,
+        },
     };
 
     struct HookCtx {
@@ -2294,12 +2360,25 @@ mod win {
         (0x15B, 0x5B),
         (0x15C, 0x5C),
     ];
-    fn modifiers_down() -> impl Iterator<Item = u32> {
+    fn vk_down(vk: i32) -> bool {
         use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+        (unsafe { GetAsyncKeyState(vk) }) as u16 & 0x8000 != 0
+    }
+    fn modifiers_down() -> impl Iterator<Item = u32> {
         MODIFIER_VKS
             .into_iter()
-            .filter(|(_, vk)| unsafe { GetAsyncKeyState(*vk) } as u16 & 0x8000 != 0)
+            .filter(|(_, vk)| vk_down(*vk))
             .map(|(id, _)| id)
+    }
+    /// Whether this modifier is still physically down as far as the system can
+    /// tell. A press swallowed by remapping never reaches the key state, so
+    /// it counts as down while remapping holds it. Unknown ids count as down.
+    fn modifier_down(id: u32) -> bool {
+        MODIFIER_VKS
+            .iter()
+            .find(|(known, _)| *known == id)
+            .is_none_or(|(_, vk)| vk_down(*vk))
+            || crate::remap::holds_key(id)
     }
     fn cursor_captured(layout: &Layout) -> bool {
         let bounds = layout.virtual_bounds();
@@ -2339,6 +2418,7 @@ mod win {
         let ctx = guard.as_mut().filter(|_| installed()).ok_or(unavailable)?;
         take_moves();
         ctx.logic.start_forwarding(anchor);
+        ctx.logic.sync_local_modifiers(modifier_down);
         ctx.logic.adopt_local_keys(modifiers_down());
         ctx.logic.session = Some(session);
         heartbeat();
@@ -2411,6 +2491,9 @@ mod win {
             }
             other => other,
         };
+        if !injected && logic.needs_modifier_sync(&event, forwarding) {
+            logic.sync_local_modifiers(modifier_down);
+        }
         let (verdict, output) = logic.handle(event, injected, forwarding, layout, Instant::now());
         match output {
             Some(Captured::Move { dx, dy }) => {
@@ -2472,7 +2555,7 @@ mod win {
                     down: wparam as u32 == WM_RBUTTONDOWN,
                 }),
                 WM_XBUTTONDOWN | WM_XBUTTONUP => Some(RawEvent::Button {
-                    index: 3,
+                    index: x_button_index(info.mouseData),
                     down: wparam as u32 == WM_XBUTTONDOWN,
                 }),
                 WM_MOUSEWHEEL => Some(RawEvent::Wheel {
@@ -2520,7 +2603,7 @@ mod win {
                 let down = info.flags & LLKHF_UP == 0;
                 let injected = info.flags & LLKHF_INJECTED != 0;
                 let event = RawEvent::Key {
-                    scan: info.scanCode & 0xFF,
+                    scan: ll_scan(info.scanCode),
                     extended,
                     down,
                 };
@@ -2538,6 +2621,32 @@ mod win {
             }
         }
         CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam)
+    }
+
+    /// The secure desktop (Ctrl+Alt+Del, UAC) and the lock screen take the
+    /// releases of keys pressed here, so the hooks never see them.
+    unsafe extern "system" fn desktop_proc(
+        _: HWINEVENTHOOK,
+        _: u32,
+        _: HWND,
+        _: i32,
+        _: i32,
+        _: u32,
+        _: u32,
+    ) {
+        with_logic(|logic| logic.forget_local_input());
+        crate::remap::desktop_switched();
+    }
+    unsafe fn install_desktop_hook() -> HWINEVENTHOOK {
+        SetWinEventHook(
+            EVENT_SYSTEM_DESKTOPSWITCH,
+            EVENT_SYSTEM_DESKTOPSWITCH,
+            std::ptr::null_mut(),
+            Some(desktop_proc),
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT,
+        )
     }
 
     struct Hooks {
@@ -2670,6 +2779,7 @@ mod win {
                 INSTALLED.store(true, Ordering::SeqCst);
                 THREAD_ID.store(id, Ordering::SeqCst);
                 let foreground = crate::remap::platform::install_foreground_hook();
+                let desktop = install_desktop_hook();
                 let timer = SetTimer(std::ptr::null_mut(), 0, TIMER_MS, None);
                 let mut health = HookHealth::default();
                 let mut last_cursor = screen::win::cursor();
@@ -2713,6 +2823,9 @@ mod win {
                 }
                 KillTimer(std::ptr::null_mut(), timer);
                 crate::remap::platform::remove_foreground_hook(foreground);
+                if !desktop.is_null() {
+                    UnhookWinEvent(desktop);
+                }
                 set_forwarding(false);
                 if let Some(hooks) = hooks.take() {
                     uninstall(hooks);
@@ -3650,6 +3763,209 @@ mod tests {
                 (Verdict::Pass, Some(Captured::Emergency))
             );
         }
+    }
+
+    #[test]
+    fn modifiers_released_on_another_desktop_do_not_trigger_emergency() {
+        let s = &Layout::single(screen());
+        let now = Instant::now();
+        let esc = key(0x01, false, true);
+        let mut logic = armed_logic(FlowEdge::Right);
+        // Ctrl+Alt+Del: both releases happen on the secure desktop.
+        logic.handle(key(0x1D, false, true), false, false, s, now);
+        logic.handle(key(0x38, false, true), false, false, s, now);
+        assert!(logic.needs_modifier_sync(&esc, false));
+        logic.sync_local_modifiers(|_| false);
+        assert_eq!(
+            logic.handle(esc, false, false, s, now),
+            (Verdict::Pass, None)
+        );
+        logic.handle(key(0x01, false, false), false, false, s, now);
+        // The stale Ctrl must not swallow the first Ctrl sent to the remote.
+        logic.start_forwarding((960, 540));
+        assert_eq!(
+            logic.handle(key(0x1D, false, true), false, true, s, now),
+            (Verdict::Swallow, key_out("ControlLeft", true))
+        );
+    }
+
+    #[test]
+    fn the_key_state_check_keeps_real_and_remote_modifiers() {
+        let s = &Layout::single(screen());
+        let now = Instant::now();
+        let esc = key(0x01, false, true);
+        let mut logic = armed_logic(FlowEdge::Right);
+        logic.handle(key(0x1D, false, true), false, false, s, now);
+        logic.handle(key(0x38, true, true), false, false, s, now);
+        logic.sync_local_modifiers(|_| true);
+        assert_eq!(
+            logic.handle(esc, false, false, s, now),
+            (Verdict::Pass, Some(Captured::Emergency))
+        );
+        // Sent to the remote, so the local key state never reports them down.
+        let mut logic = armed_logic(FlowEdge::Right);
+        logic.start_forwarding((960, 540));
+        logic.handle(key(0x1D, false, true), false, true, s, now);
+        logic.handle(key(0x38, false, true), false, true, s, now);
+        assert!(logic.needs_modifier_sync(&esc, true));
+        logic.sync_local_modifiers(|_| false);
+        assert_eq!(
+            logic.handle(esc, false, true, s, now),
+            (Verdict::Pass, Some(Captured::Emergency))
+        );
+        // Desktop switch: only the local presses are forgotten.
+        let mut logic = armed_logic(FlowEdge::Right);
+        logic.handle(key(0x1D, false, true), false, false, s, now);
+        logic.start_forwarding((960, 540));
+        logic.handle(key(0x38, false, true), false, true, s, now);
+        logic.forget_local_input();
+        assert!(!logic.key_held(0x1D, false) && logic.key_held(0x38, false));
+    }
+
+    #[test]
+    fn a_stale_ctrl_does_not_switch_a_ctrl_edge() {
+        let mut logic = CaptureLogic::default();
+        logic.set_arm(
+            "peer",
+            config(FlowEdge::Left, FlowMode::CtrlEdge, 250, true),
+        );
+        let s = &Layout::single(screen());
+        let now = Instant::now();
+        let edge = RawEvent::Move {
+            x: 0,
+            y: 5,
+            from: None,
+        };
+        assert!(!logic.needs_modifier_sync(&edge, false));
+        logic.handle(key(0x1D, true, true), false, false, s, now);
+        assert!(logic.needs_modifier_sync(&edge, false));
+        assert!(!logic.needs_modifier_sync(&edge, true));
+        logic.sync_local_modifiers(|_| false);
+        assert_eq!(
+            logic.handle(edge, false, false, s, now),
+            (Verdict::Pass, None)
+        );
+        // Still held: auto-repeat restores it and the system reports it down.
+        logic.handle(key(0x1D, true, true), false, false, s, now);
+        logic.sync_local_modifiers(|_| true);
+        assert!(matches!(
+            logic.handle(edge, false, false, s, now).1,
+            Some(Captured::EdgeHit { .. })
+        ));
+    }
+
+    #[test]
+    fn altgr_fake_ctrl_is_never_a_real_ctrl() {
+        assert_eq!(ll_scan(0x1D), 0x1D);
+        assert_eq!(ll_scan(0xFF), 0xFF);
+        let fake = ll_scan(0x21D);
+        assert!(key_id(fake, false) >= 0x200 && key_id(fake, true) >= 0x200);
+        let altgr = |down| {
+            [
+                key(ll_scan(0x21D), false, down),
+                key(ll_scan(0x38), true, down),
+            ]
+        };
+        let s = &Layout::single(screen());
+        let now = Instant::now();
+        // Locally AltGr+Esc is not Ctrl+Alt+Esc.
+        let mut logic = armed_logic(FlowEdge::Right);
+        for event in altgr(true) {
+            assert_eq!(
+                logic.handle(event, false, false, s, now),
+                (Verdict::Pass, None)
+            );
+        }
+        let esc = key(0x01, false, true);
+        assert!(!logic.needs_modifier_sync(&esc, false));
+        assert_eq!(
+            logic.handle(esc, false, false, s, now),
+            (Verdict::Pass, None)
+        );
+        // Forwarding: only AltRight reaches the remote, never Ctrl or Command.
+        let mut logic = armed_logic(FlowEdge::Right);
+        logic.swap_command_control = true;
+        logic.start_forwarding((960, 540));
+        for down in [true, false] {
+            let [ctrl, alt] = altgr(down);
+            assert_eq!(
+                logic.handle(ctrl, false, true, s, now),
+                (Verdict::Swallow, None)
+            );
+            assert_eq!(
+                logic.handle(alt, false, true, s, now),
+                (Verdict::Swallow, key_out("AltRight", down))
+            );
+        }
+        assert!(logic.end_forwarding("peer").is_empty());
+    }
+
+    #[test]
+    fn altgr_held_across_the_edge_is_released_locally() {
+        let altgr = |down| {
+            [
+                key(ll_scan(0x21D), false, down),
+                key(ll_scan(0x38), true, down),
+            ]
+        };
+        let s = &Layout::single(screen());
+        let now = Instant::now();
+        // Pressed locally, released while forwarding: the local system saw
+        // both downs, so both ups must reach it too.
+        let mut logic = armed_logic(FlowEdge::Right);
+        for event in altgr(true) {
+            assert_eq!(
+                logic.handle(event, false, false, s, now),
+                (Verdict::Pass, None)
+            );
+        }
+        logic.start_forwarding((960, 540));
+        for event in altgr(false) {
+            assert_eq!(
+                logic.handle(event, false, true, s, now),
+                (Verdict::Pass, None)
+            );
+        }
+        assert!(logic.end_forwarding("peer").is_empty());
+        // Pressed while forwarding, released after: the local system never
+        // saw the fake Ctrl down, so its up stays away from it.
+        let mut logic = armed_logic(FlowEdge::Right);
+        logic.start_forwarding((960, 540));
+        let [ctrl, alt] = altgr(true);
+        logic.handle(ctrl, false, true, s, now);
+        logic.handle(alt, false, true, s, now);
+        assert_eq!(
+            logic.end_forwarding("peer"),
+            vec![InputEvent::Key {
+                key: "AltRight".into(),
+                down: false
+            }]
+        );
+        for event in altgr(false) {
+            assert_eq!(
+                logic.handle(event, false, false, s, now),
+                (Verdict::Swallow, None)
+            );
+        }
+    }
+
+    #[test]
+    fn back_and_forward_buttons_keep_separate_state() {
+        let (back, forward) = (x_button_index(0x0001_0000), x_button_index(0x0002_0000));
+        assert_eq!((back, forward), (3, 4));
+        let button = |index, down| RawEvent::Button { index, down };
+        let s = &Layout::single(screen());
+        let now = Instant::now();
+        let mut logic = armed_logic(FlowEdge::Right);
+        logic.handle(button(back, true), false, false, s, now);
+        logic.start_forwarding((960, 540));
+        logic.handle(button(forward, true), false, true, s, now);
+        logic.handle(button(forward, false), false, true, s, now);
+        assert_eq!(
+            logic.handle(button(back, false), false, true, s, now),
+            (Verdict::Pass, None),
+            "Back was pressed locally, so its release goes to the local system"
+        );
     }
 
     #[test]

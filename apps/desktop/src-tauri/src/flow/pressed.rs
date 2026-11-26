@@ -14,11 +14,15 @@ pub trait Slots: Copy + Default {
     fn take(&mut self, id: u32) -> bool;
     fn any(&self) -> bool;
     fn union(&mut self, other: &Self);
+    fn remove(&mut self, other: &Self);
 }
 
-const KEY_WORDS: usize = 16;
+const KEY_WORDS: usize = 24;
 const UNMAPPED_BASE: u32 = 0x1000;
-const MAPPED_SLOTS: u32 = 0x200;
+// Real key ids are below 0x200. Ids 0x200..0x400 are synthetic Windows keys
+// such as AltGr's fake left Ctrl: never sent, but tracked so each release
+// goes where its press went.
+const MAPPED_SLOTS: u32 = 0x400;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct KeySet([u64; KEY_WORDS]);
@@ -76,6 +80,11 @@ impl Slots for KeySet {
             *word |= extra;
         }
     }
+    fn remove(&mut self, other: &Self) {
+        for (word, gone) in self.0.iter_mut().zip(other.0) {
+            *word &= !gone;
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -108,6 +117,9 @@ impl Slots for ButtonSet {
     }
     fn union(&mut self, other: &Self) {
         self.0 |= other.0;
+    }
+    fn remove(&mut self, other: &Self) {
+        self.0 &= !other.0;
     }
 }
 
@@ -191,6 +203,23 @@ impl<S: Slots> Tracker<S> {
             self.local.put(id);
         }
     }
+    /// Forgets a local press whose release the hook never saw, for example
+    /// one released on the secure desktop. Presses owned by the remote are
+    /// kept so their release still stays away from the local system.
+    pub fn forget_local(&mut self, id: u32) {
+        if !self.remote.has(id) && !self.released.has(id) {
+            self.held.take(id);
+            self.local.take(id);
+        }
+    }
+    /// Forgets every local press, as `forget_local` does for one id.
+    pub fn forget_all_local(&mut self) {
+        let mut stale = self.local;
+        stale.remove(&self.remote);
+        stale.remove(&self.released);
+        self.held.remove(&stale);
+        self.local.remove(&stale);
+    }
     pub fn begin(&mut self) {
         self.finish();
     }
@@ -214,16 +243,21 @@ mod tests {
     #[test]
     fn key_set_covers_mapped_and_unmapped_ids() {
         let mut set = KeySet::default();
-        for id in [0x00, 0x1D, 0x11D, 0x1FF, 0x1000, 0x1033, 0x11FF] {
+        for id in [
+            0x00, 0x1D, 0x11D, 0x1FF, 0x21D, 0x3FF, 0x1000, 0x1033, 0x11FF,
+        ] {
             assert!(set.put(id), "{id:#x}");
             assert!(set.has(id));
         }
         assert!(!set.put(0x1D));
-        assert!(!set.put(0x200));
-        assert!(!set.has(0x200));
+        assert!(!set.put(0x400));
+        assert!(!set.has(0x400));
         assert!(!set.put(0x5000));
         let ids: Vec<u32> = set.iter().collect();
-        assert_eq!(ids, vec![0x00, 0x1D, 0x11D, 0x1FF, 0x1000, 0x1033, 0x11FF]);
+        assert_eq!(
+            ids,
+            vec![0x00, 0x1D, 0x11D, 0x1FF, 0x21D, 0x3FF, 0x1000, 0x1033, 0x11FF]
+        );
         assert!(set.take(0x11D) && !set.take(0x11D));
         assert!(set.any());
     }
@@ -335,6 +369,35 @@ mod tests {
         assert_eq!(released, vec![2]);
         assert_eq!(buttons.route(2, false, false), Route::Drop);
         assert_eq!(buttons.route(1, false, true), Route::Drop);
+    }
+
+    #[test]
+    fn forgetting_local_presses_keeps_the_remote_ones() {
+        let mut keys = KeyTracker::default();
+        keys.route(ALT, true, false);
+        keys.begin();
+        keys.route(A, true, true);
+        keys.forget_local(ALT);
+        keys.forget_local(A);
+        assert!(!keys.held(ALT) && !keys.local_down(ALT));
+        assert!(keys.held(A) && keys.forwarded_down(A), "the remote owns A");
+        assert_eq!(keys.route(ALT, true, true), Route::Forward, "not a repeat");
+        keys.finish();
+        keys.route(0x11D, true, false);
+        keys.forget_all_local();
+        assert!(!keys.held(0x11D) && !keys.local_down(0x11D));
+        assert!(keys.held(A) && keys.awaiting_release(A));
+        assert_eq!(keys.route(A, false, false), Route::Drop);
+    }
+
+    #[test]
+    fn separate_side_buttons_never_take_each_others_release() {
+        let mut buttons = ButtonTracker::default();
+        assert_eq!(buttons.route(3, true, false), Route::Local);
+        buttons.begin();
+        assert_eq!(buttons.route(4, true, true), Route::Forward);
+        assert_eq!(buttons.route(4, false, true), Route::Forward);
+        assert_eq!(buttons.route(3, false, true), Route::Local);
     }
 
     #[test]
