@@ -6,6 +6,7 @@ import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { messageFrom, nativeCommand, type ConnectedPeer } from "@/lib/bridge";
 import { allowLocally, askPeerForInput } from "@/lib/permissions";
+import { keepaliveFailureNotice } from "@/lib/control-session";
 
 type InputEvent = { type: "key"; key: string; down: boolean } | { type: "move"; x: number; y: number } | { type: "button"; button: number; down: boolean } | { type: "scroll"; x: number; y: number };
 
@@ -66,8 +67,14 @@ export function InputControl({ peer, enabled, onPermissionsChanged }: { peer: Co
     if (!active) return;
     const node = pane.current;
     node?.focus();
+    const started = generation.current;
     const keepalive = window.setInterval(() => {
-      void nativeCommand("input_keepalive", { peerId: peer.id }).catch(() => stop());
+      void nativeCommand("input_keepalive", { peerId: peer.id }).catch(error => {
+        const notice = keepaliveFailureNotice(error, { active: activeRef.current, started, current: generation.current });
+        if (!notice) return;
+        stop();
+        toast.error(`Control of ${peer.name} ended.`, { description: notice });
+      });
     }, 1000);
     const wheel = (event: WheelEvent) => {
       if (!activeRef.current) return;
@@ -79,7 +86,7 @@ export function InputControl({ peer, enabled, onPermissionsChanged }: { peer: Co
     const visibility = () => { if (document.hidden) stop(); };
     document.addEventListener("visibilitychange", visibility);
     return () => { window.clearInterval(keepalive); node?.removeEventListener("wheel", wheel); window.removeEventListener("blur", stop); document.removeEventListener("visibilitychange", visibility); };
-  }, [active, peer.id, send, stop]);
+  }, [active, peer.id, peer.name, send, stop]);
 
   useEffect(() => { if (!enabled || !peer.connected) stop(); }, [enabled, peer.connected, stop]);
   useEffect(() => {
