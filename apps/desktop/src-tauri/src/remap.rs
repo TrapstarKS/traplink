@@ -617,6 +617,45 @@ impl Engine {
     pub fn emergency(&mut self) -> Vec<Synth> {
         self.set_enabled(false)
     }
+    /// The input desktop changed: releases made there never reach the hook.
+    /// Forgets Ctrl and Alt and releases held output. A key that is still
+    /// held sets its bit again with its next auto-repeat.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub fn reset_modifiers(&mut self) -> Vec<Synth> {
+        self.suspend()
+    }
+    /// Whether this physical key's press was swallowed and is still tracked,
+    /// so the system key state cannot report it.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub fn holds(&self, source: Source) -> bool {
+        source
+            .slot()
+            .is_some_and(|index| matches!(self.slots[index], Slot::Held(_) | Slot::Orphan))
+    }
+    /// Before an Esc press is read as Ctrl+Alt+Esc, drops Ctrl and Alt bits
+    /// whose key was passed to the system and that it now reports up: their
+    /// release went to another desktop. Swallowed keys are always kept.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub fn sync_modifiers(&mut self, source: Source, down: bool, physical: impl Fn(u16) -> bool) {
+        if !down || source != Source::Key(ESCAPE) || self.ctrl == 0 || self.alt == 0 {
+            return;
+        }
+        for (id, bit) in [(0x1D, 1), (0x11D, 2), (0x38, 1), (0x138, 2)] {
+            let bits = if id & 0xFF == 0x1D {
+                self.ctrl
+            } else {
+                self.alt
+            };
+            if bits & bit == 0 || self.holds(Source::Key(id)) || physical(id) {
+                continue;
+            }
+            if id & 0xFF == 0x1D {
+                self.ctrl &= !bit;
+            } else {
+                self.alt &= !bit;
+            }
+        }
+    }
 
     pub fn handle(&mut self, source: Source, down: bool, out: &mut Out) -> Verdict {
         if let Source::Key(id) = source {
@@ -740,6 +779,7 @@ fn hook(source: Source, down: bool, forwarding: bool) -> bool {
         platform::send(released.iter().copied());
         return false;
     }
+    engine.sync_modifiers(source, down, platform::key_down);
     let mut out = Out::default();
     let verdict = engine.handle(source, down, &mut out);
     let emergency = (verdict == Verdict::Emergency).then(|| engine.emergency());
@@ -753,6 +793,24 @@ fn hook(source: Source, down: bool, forwarding: bool) -> bool {
         }
     }
     verdict == Verdict::Swallow
+}
+
+/// Whether remapping swallowed this physical key's press and still tracks it.
+/// Counts as held when the engine is busy, so callers never drop a real press.
+#[cfg(target_os = "windows")]
+pub(crate) fn holds_key(id: u32) -> bool {
+    let Ok(id) = u16::try_from(id) else {
+        return false;
+    };
+    try_engine().is_none_or(|engine| engine.holds(Source::Key(id)))
+}
+#[cfg(target_os = "windows")]
+pub(crate) fn desktop_switched() {
+    if !ACTIVE.load(Ordering::Acquire) {
+        return;
+    }
+    let released = lock(engine()).reset_modifiers();
+    platform::send(released.iter().copied());
 }
 
 pub(crate) fn refresh_foreground(force: bool) {
@@ -999,8 +1057,9 @@ pub(crate) mod platform {
         UI::{
             Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK},
             Input::KeyboardAndMouse::{
-                SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
-                KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE,
+                GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
+                KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, VK_LCONTROL, VK_LMENU,
+                VK_RCONTROL, VK_RMENU,
             },
             WindowsAndMessaging::*,
         },
@@ -1086,6 +1145,18 @@ pub(crate) mod platform {
     }
     pub fn foreground_window() -> usize {
         unsafe { GetForegroundWindow() as usize }
+    }
+    /// Whether Windows reports this Ctrl or Alt key down. Other ids count as
+    /// down, so they are never forgotten.
+    pub fn key_down(id: u16) -> bool {
+        let vk = match id {
+            0x1D => VK_LCONTROL,
+            0x11D => VK_RCONTROL,
+            0x38 => VK_LMENU,
+            0x138 => VK_RMENU,
+            _ => return true,
+        };
+        unsafe { GetAsyncKeyState(i32::from(vk)) as u16 & 0x8000 != 0 }
     }
     pub fn describe(window: usize) -> Foreground {
         if window == 0 {
@@ -1473,6 +1544,58 @@ mod tests {
             run(&mut engine, src("Escape"), true),
             (Verdict::Swallow, vec![d("KeyA")])
         );
+    }
+
+    #[test]
+    fn stale_modifiers_from_another_desktop_do_not_trigger_emergency() {
+        let mut engine = engine_with(&[("KeyQ", "KeyE")]);
+        run(&mut engine, src("ControlLeft"), true);
+        run(&mut engine, src("AltRight"), true);
+        // Ctrl+Alt+Del: both releases happen on the secure desktop.
+        engine.sync_modifiers(src("Escape"), true, |_| false);
+        assert_eq!(run(&mut engine, src("Escape"), true).0, Verdict::Pass);
+        assert!(engine.enabled());
+    }
+
+    #[test]
+    fn ctrl_alt_esc_still_triggers_after_the_key_state_check() {
+        let mut engine = engine_with(&[]);
+        run(&mut engine, src("ControlRight"), true);
+        run(&mut engine, src("AltLeft"), true);
+        engine.sync_modifiers(src("Escape"), true, |_| true);
+        assert_eq!(run(&mut engine, src("Escape"), true).0, Verdict::Emergency);
+        // A remapped modifier never reaches the key state, so it must count.
+        let mut engine = engine_with(&[("ControlLeft", "disabled"), ("AltLeft", "KeyB")]);
+        run(&mut engine, src("ControlLeft"), true);
+        run(&mut engine, src("AltLeft"), true);
+        engine.sync_modifiers(src("Escape"), true, |_| false);
+        assert_eq!(run(&mut engine, src("Escape"), true).0, Verdict::Emergency);
+        // Only one side is stale: the other Ctrl is really held.
+        let mut engine = engine_with(&[]);
+        run(&mut engine, src("ControlLeft"), true);
+        run(&mut engine, src("ControlRight"), true);
+        run(&mut engine, src("AltLeft"), true);
+        engine.sync_modifiers(src("Escape"), true, |id| id != 0x1D);
+        assert_eq!(run(&mut engine, src("Escape"), true).0, Verdict::Emergency);
+    }
+
+    #[test]
+    fn desktop_switch_forgets_modifiers_and_releases_held_output() {
+        let mut engine = engine_with(&[("KeyQ", "KeyE")]);
+        run(&mut engine, src("ControlLeft"), true);
+        run(&mut engine, src("AltLeft"), true);
+        run(&mut engine, src("KeyQ"), true);
+        assert!(engine.holds(src("KeyQ")) && !engine.holds(src("ControlLeft")));
+        assert_eq!(engine.reset_modifiers(), vec![u("KeyE")]);
+        assert_eq!(run(&mut engine, src("Escape"), true).0, Verdict::Pass);
+        assert_eq!(
+            run(&mut engine, src("KeyQ"), false),
+            (Verdict::Swallow, vec![])
+        );
+        // Still held: the next auto-repeat restores the modifier.
+        run(&mut engine, src("ControlLeft"), true);
+        run(&mut engine, src("AltLeft"), true);
+        assert_eq!(run(&mut engine, src("Escape"), true).0, Verdict::Emergency);
     }
 
     #[test]

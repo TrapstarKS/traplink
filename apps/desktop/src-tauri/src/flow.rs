@@ -588,6 +588,46 @@ impl CaptureLogic {
             self.keys.adopt_local(id);
         }
     }
+    /// Whether the tracked modifiers decide this event, so they should first
+    /// be checked against the system: Esc with Ctrl and Alt (the emergency
+    /// stop), or a local move while Ctrl is held and a Ctrl edge is armed.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub fn needs_modifier_sync(&self, event: &RawEvent, forwarding: bool) -> bool {
+        match *event {
+            RawEvent::Key {
+                scan: 0x01,
+                extended: false,
+                down: true,
+            } => self.ctrl() && self.alt(),
+            RawEvent::Move { .. } if !forwarding => {
+                self.ctrl()
+                    && self
+                        .arms
+                        .iter()
+                        .any(|arm| arm.tracker.config.mode == FlowMode::CtrlEdge)
+            }
+            _ => false,
+        }
+    }
+    /// Drops modifiers that were passed to the local system but that it no
+    /// longer reports down, because their release went to another desktop.
+    /// Modifiers owned by the remote are kept: the local system never saw them.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub fn sync_local_modifiers(&mut self, down: impl Fn(u32) -> bool) {
+        for id in MODIFIER_IDS {
+            if self.keys.held(id) && !down(id) {
+                self.keys.forget_local(id);
+            }
+        }
+    }
+    /// The input desktop changed (secure desktop, lock or UAC). Releases made
+    /// there never reach the hook, so local presses are forgotten. A key that
+    /// is still held comes back with its next auto-repeat.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub fn forget_local_input(&mut self) {
+        self.keys.forget_all_local();
+        self.buttons.forget_all_local();
+    }
     fn key_event(&self, id: u32, down: bool) -> Option<InputEvent> {
         if id >= 0x200 {
             return None;
@@ -2212,9 +2252,12 @@ mod win {
     };
     use tokio::sync::mpsc::UnboundedSender;
     use windows_sys::Win32::{
-        Foundation::{LPARAM, LRESULT, WPARAM},
+        Foundation::{HWND, LPARAM, LRESULT, WPARAM},
         System::{LibraryLoader::GetModuleHandleW, Threading::GetCurrentThreadId},
-        UI::WindowsAndMessaging::*,
+        UI::{
+            Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK},
+            WindowsAndMessaging::*,
+        },
     };
 
     struct HookCtx {
@@ -2294,12 +2337,25 @@ mod win {
         (0x15B, 0x5B),
         (0x15C, 0x5C),
     ];
-    fn modifiers_down() -> impl Iterator<Item = u32> {
+    fn vk_down(vk: i32) -> bool {
         use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+        (unsafe { GetAsyncKeyState(vk) }) as u16 & 0x8000 != 0
+    }
+    fn modifiers_down() -> impl Iterator<Item = u32> {
         MODIFIER_VKS
             .into_iter()
-            .filter(|(_, vk)| unsafe { GetAsyncKeyState(*vk) } as u16 & 0x8000 != 0)
+            .filter(|(_, vk)| vk_down(*vk))
             .map(|(id, _)| id)
+    }
+    /// Whether this modifier is still physically down as far as the system can
+    /// tell. A press swallowed by remapping never reaches the key state, so
+    /// it counts as down while remapping holds it. Unknown ids count as down.
+    fn modifier_down(id: u32) -> bool {
+        MODIFIER_VKS
+            .iter()
+            .find(|(known, _)| *known == id)
+            .is_none_or(|(_, vk)| vk_down(*vk))
+            || crate::remap::holds_key(id)
     }
     fn cursor_captured(layout: &Layout) -> bool {
         let bounds = layout.virtual_bounds();
@@ -2339,6 +2395,7 @@ mod win {
         let ctx = guard.as_mut().filter(|_| installed()).ok_or(unavailable)?;
         take_moves();
         ctx.logic.start_forwarding(anchor);
+        ctx.logic.sync_local_modifiers(modifier_down);
         ctx.logic.adopt_local_keys(modifiers_down());
         ctx.logic.session = Some(session);
         heartbeat();
@@ -2411,6 +2468,9 @@ mod win {
             }
             other => other,
         };
+        if !injected && logic.needs_modifier_sync(&event, forwarding) {
+            logic.sync_local_modifiers(modifier_down);
+        }
         let (verdict, output) = logic.handle(event, injected, forwarding, layout, Instant::now());
         match output {
             Some(Captured::Move { dx, dy }) => {
@@ -2538,6 +2598,32 @@ mod win {
             }
         }
         CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam)
+    }
+
+    /// The secure desktop (Ctrl+Alt+Del, UAC) and the lock screen take the
+    /// releases of keys pressed here, so the hooks never see them.
+    unsafe extern "system" fn desktop_proc(
+        _: HWINEVENTHOOK,
+        _: u32,
+        _: HWND,
+        _: i32,
+        _: i32,
+        _: u32,
+        _: u32,
+    ) {
+        with_logic(|logic| logic.forget_local_input());
+        crate::remap::desktop_switched();
+    }
+    unsafe fn install_desktop_hook() -> HWINEVENTHOOK {
+        SetWinEventHook(
+            EVENT_SYSTEM_DESKTOPSWITCH,
+            EVENT_SYSTEM_DESKTOPSWITCH,
+            std::ptr::null_mut(),
+            Some(desktop_proc),
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT,
+        )
     }
 
     struct Hooks {
@@ -2670,6 +2756,7 @@ mod win {
                 INSTALLED.store(true, Ordering::SeqCst);
                 THREAD_ID.store(id, Ordering::SeqCst);
                 let foreground = crate::remap::platform::install_foreground_hook();
+                let desktop = install_desktop_hook();
                 let timer = SetTimer(std::ptr::null_mut(), 0, TIMER_MS, None);
                 let mut health = HookHealth::default();
                 let mut last_cursor = screen::win::cursor();
@@ -2713,6 +2800,9 @@ mod win {
                 }
                 KillTimer(std::ptr::null_mut(), timer);
                 crate::remap::platform::remove_foreground_hook(foreground);
+                if !desktop.is_null() {
+                    UnhookWinEvent(desktop);
+                }
                 set_forwarding(false);
                 if let Some(hooks) = hooks.take() {
                     uninstall(hooks);
@@ -3650,6 +3740,95 @@ mod tests {
                 (Verdict::Pass, Some(Captured::Emergency))
             );
         }
+    }
+
+    #[test]
+    fn modifiers_released_on_another_desktop_do_not_trigger_emergency() {
+        let s = &Layout::single(screen());
+        let now = Instant::now();
+        let esc = key(0x01, false, true);
+        let mut logic = armed_logic(FlowEdge::Right);
+        // Ctrl+Alt+Del: both releases happen on the secure desktop.
+        logic.handle(key(0x1D, false, true), false, false, s, now);
+        logic.handle(key(0x38, false, true), false, false, s, now);
+        assert!(logic.needs_modifier_sync(&esc, false));
+        logic.sync_local_modifiers(|_| false);
+        assert_eq!(
+            logic.handle(esc, false, false, s, now),
+            (Verdict::Pass, None)
+        );
+        logic.handle(key(0x01, false, false), false, false, s, now);
+        // The stale Ctrl must not swallow the first Ctrl sent to the remote.
+        logic.start_forwarding((960, 540));
+        assert_eq!(
+            logic.handle(key(0x1D, false, true), false, true, s, now),
+            (Verdict::Swallow, key_out("ControlLeft", true))
+        );
+    }
+
+    #[test]
+    fn the_key_state_check_keeps_real_and_remote_modifiers() {
+        let s = &Layout::single(screen());
+        let now = Instant::now();
+        let esc = key(0x01, false, true);
+        let mut logic = armed_logic(FlowEdge::Right);
+        logic.handle(key(0x1D, false, true), false, false, s, now);
+        logic.handle(key(0x38, true, true), false, false, s, now);
+        logic.sync_local_modifiers(|_| true);
+        assert_eq!(
+            logic.handle(esc, false, false, s, now),
+            (Verdict::Pass, Some(Captured::Emergency))
+        );
+        // Sent to the remote, so the local key state never reports them down.
+        let mut logic = armed_logic(FlowEdge::Right);
+        logic.start_forwarding((960, 540));
+        logic.handle(key(0x1D, false, true), false, true, s, now);
+        logic.handle(key(0x38, false, true), false, true, s, now);
+        assert!(logic.needs_modifier_sync(&esc, true));
+        logic.sync_local_modifiers(|_| false);
+        assert_eq!(
+            logic.handle(esc, false, true, s, now),
+            (Verdict::Pass, Some(Captured::Emergency))
+        );
+        // Desktop switch: only the local presses are forgotten.
+        let mut logic = armed_logic(FlowEdge::Right);
+        logic.handle(key(0x1D, false, true), false, false, s, now);
+        logic.start_forwarding((960, 540));
+        logic.handle(key(0x38, false, true), false, true, s, now);
+        logic.forget_local_input();
+        assert!(!logic.key_held(0x1D, false) && logic.key_held(0x38, false));
+    }
+
+    #[test]
+    fn a_stale_ctrl_does_not_switch_a_ctrl_edge() {
+        let mut logic = CaptureLogic::default();
+        logic.set_arm(
+            "peer",
+            config(FlowEdge::Left, FlowMode::CtrlEdge, 250, true),
+        );
+        let s = &Layout::single(screen());
+        let now = Instant::now();
+        let edge = RawEvent::Move {
+            x: 0,
+            y: 5,
+            from: None,
+        };
+        assert!(!logic.needs_modifier_sync(&edge, false));
+        logic.handle(key(0x1D, true, true), false, false, s, now);
+        assert!(logic.needs_modifier_sync(&edge, false));
+        assert!(!logic.needs_modifier_sync(&edge, true));
+        logic.sync_local_modifiers(|_| false);
+        assert_eq!(
+            logic.handle(edge, false, false, s, now),
+            (Verdict::Pass, None)
+        );
+        // Still held: auto-repeat restores it and the system reports it down.
+        logic.handle(key(0x1D, true, true), false, false, s, now);
+        logic.sync_local_modifiers(|_| true);
+        assert!(matches!(
+            logic.handle(edge, false, false, s, now).1,
+            Some(Captured::EdgeHit { .. })
+        ));
     }
 
     #[test]

@@ -14,6 +14,7 @@ pub trait Slots: Copy + Default {
     fn take(&mut self, id: u32) -> bool;
     fn any(&self) -> bool;
     fn union(&mut self, other: &Self);
+    fn remove(&mut self, other: &Self);
 }
 
 const KEY_WORDS: usize = 16;
@@ -76,6 +77,11 @@ impl Slots for KeySet {
             *word |= extra;
         }
     }
+    fn remove(&mut self, other: &Self) {
+        for (word, gone) in self.0.iter_mut().zip(other.0) {
+            *word &= !gone;
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -108,6 +114,9 @@ impl Slots for ButtonSet {
     }
     fn union(&mut self, other: &Self) {
         self.0 |= other.0;
+    }
+    fn remove(&mut self, other: &Self) {
+        self.0 &= !other.0;
     }
 }
 
@@ -190,6 +199,23 @@ impl<S: Slots> Tracker<S> {
         if !self.remote.has(id) && !self.released.has(id) {
             self.local.put(id);
         }
+    }
+    /// Forgets a local press whose release the hook never saw, for example
+    /// one released on the secure desktop. Presses owned by the remote are
+    /// kept so their release still stays away from the local system.
+    pub fn forget_local(&mut self, id: u32) {
+        if !self.remote.has(id) && !self.released.has(id) {
+            self.held.take(id);
+            self.local.take(id);
+        }
+    }
+    /// Forgets every local press, as `forget_local` does for one id.
+    pub fn forget_all_local(&mut self) {
+        let mut stale = self.local;
+        stale.remove(&self.remote);
+        stale.remove(&self.released);
+        self.held.remove(&stale);
+        self.local.remove(&stale);
     }
     pub fn begin(&mut self) {
         self.finish();
@@ -335,6 +361,25 @@ mod tests {
         assert_eq!(released, vec![2]);
         assert_eq!(buttons.route(2, false, false), Route::Drop);
         assert_eq!(buttons.route(1, false, true), Route::Drop);
+    }
+
+    #[test]
+    fn forgetting_local_presses_keeps_the_remote_ones() {
+        let mut keys = KeyTracker::default();
+        keys.route(ALT, true, false);
+        keys.begin();
+        keys.route(A, true, true);
+        keys.forget_local(ALT);
+        keys.forget_local(A);
+        assert!(!keys.held(ALT) && !keys.local_down(ALT));
+        assert!(keys.held(A) && keys.forwarded_down(A), "the remote owns A");
+        assert_eq!(keys.route(ALT, true, true), Route::Forward, "not a repeat");
+        keys.finish();
+        keys.route(0x11D, true, false);
+        keys.forget_all_local();
+        assert!(!keys.held(0x11D) && !keys.local_down(0x11D));
+        assert!(keys.held(A) && keys.awaiting_release(A));
+        assert_eq!(keys.route(A, false, false), Route::Drop);
     }
 
     #[test]
