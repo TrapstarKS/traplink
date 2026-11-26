@@ -241,6 +241,21 @@ impl Drop for AutomaticShare {
     }
 }
 
+/// The reply to a clipboard the peer sends while this computer's automatic
+/// share to it runs. Automatic shares on the peer ignore it.
+const SHARING_OWN_CLIPBOARD: &str = "The other computer is sharing its clipboard right now.";
+/// Refuses a clipboard from `id` while this computer's automatic share to it
+/// runs. Switching back quickly would otherwise swap the two clipboards: the
+/// peer's older copy lands here before this copy reaches the peer.
+fn refuse_while_sharing(core: &Core, id: &str) -> Result<(), String> {
+    match session(core, id) {
+        Ok(link) if link.clipboard.outgoing.load(Ordering::SeqCst) => {
+            Err(SHARING_OWN_CLIPBOARD.into())
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Identifies clipboard content without keeping it.
 #[derive(Clone, PartialEq, Eq)]
 enum ClipboardDigest {
@@ -301,32 +316,31 @@ async fn content_digest(content: crate::clipboard::Content) -> Option<ClipboardD
 struct PeerClipboard {
     /// Content both computers hold after the last transfer between them.
     synced: Vec<ClipboardDigest>,
-    /// The newest folder of copied files received from this peer.
-    folder: Option<PathBuf>,
+    /// Whether that transfer came from the peer. This computer reads its own
+    /// clipboard, so it knows that copy is still here. A copy it sent may
+    /// since have been replaced on the peer without TrapLink seeing it.
+    received: bool,
 }
 
 /// Remembers per peer what the last clipboard transfer left on both computers.
 #[derive(Default)]
 pub struct ClipboardLedger(Mutex<HashMap<String, PeerClipboard>>);
 impl ClipboardLedger {
+    /// Whether an automatic share of `digest` to `peer` can be skipped. Text
+    /// this computer sent is always sent again: it is small, and the peer may
+    /// hold another copy by now. Text that came from the peer is not echoed.
     fn is_synced(&self, peer: &str, digest: &ClipboardDigest) -> bool {
-        self.0
-            .lock()
-            .is_ok_and(|peers| peers.get(peer).is_some_and(|p| p.synced.contains(digest)))
+        self.0.lock().is_ok_and(|peers| {
+            peers.get(peer).is_some_and(|p| {
+                p.synced.contains(digest)
+                    && (p.received || !matches!(digest, ClipboardDigest::Text(_)))
+            })
+        })
     }
-    fn record(&self, peer: &str, synced: Vec<ClipboardDigest>) {
+    fn record(&self, peer: &str, synced: Vec<ClipboardDigest>, received: bool) {
         if let Ok(mut peers) = self.0.lock() {
-            peers.entry(peer.to_owned()).or_default().synced = synced;
+            peers.insert(peer.to_owned(), PeerClipboard { synced, received });
         }
-    }
-    /// Returns the folder this one replaces.
-    fn replace_folder(&self, peer: &str, folder: PathBuf) -> Option<PathBuf> {
-        let mut peers = self.0.lock().ok()?;
-        peers
-            .entry(peer.to_owned())
-            .or_default()
-            .folder
-            .replace(folder)
     }
 }
 
@@ -337,16 +351,9 @@ fn is_partial_name(name: &str) -> bool {
         .and_then(|id| Uuid::parse_str(id).ok().map(|uuid| uuid.to_string() == id))
         .unwrap_or(false)
 }
-/// Matches only the `Clipboard-XXXXXX` folders TrapLink creates for copied files.
-fn is_clipboard_folder_name(name: &str) -> bool {
-    name.strip_prefix("Clipboard-").is_some_and(|suffix| {
-        suffix.len() == 6 && suffix.bytes().all(|b| b.is_ascii_alphanumeric())
-    })
-}
-
-/// Removes TrapLink's own leftovers from the receive folder: partial
-/// `.<uuid>.part` files and copied-file folders older than `older_than`.
-/// Symbolic links and every other entry are left alone.
+/// Removes TrapLink's own partial `.<uuid>.part` files older than
+/// `older_than` from the receive folder. Copied-file folders, symbolic links
+/// and every other entry are left alone: users may keep received copies.
 fn sweep_receive_folder(directory: &Path, older_than: Duration, now: SystemTime) {
     let Ok(entries) = std::fs::read_dir(directory) else {
         return;
@@ -367,8 +374,6 @@ fn sweep_receive_folder(directory: &Path, older_than: Duration, now: SystemTime)
         };
         if meta.file_type().is_file() && is_partial_name(name) {
             let _ = std::fs::remove_file(&path);
-        } else if meta.file_type().is_dir() && is_clipboard_folder_name(name) {
-            let _ = std::fs::remove_dir_all(&path);
         }
     }
 }
@@ -1560,6 +1565,7 @@ async fn incoming(
         Wire::InputKeepalive => incoming_input(core, peer, None, FlowPacket::Keepalive),
         Wire::Clipboard { request, text } => {
             let result = permit(core, &peer.id, false).and_then(|_| {
+                refuse_while_sharing(core, &peer.id)?;
                 if text.len() <= MAX_CLIPBOARD {
                     Ok(())
                 } else {
@@ -1573,7 +1579,7 @@ async fn incoming(
                     .write(crate::clipboard::Content::Text(text))
                     .await;
                 if written.is_ok() {
-                    core.clipboard_sync.record(&peer.id, vec![digest]);
+                    core.clipboard_sync.record(&peer.id, vec![digest], true);
                 }
                 written
             } else {
@@ -1594,6 +1600,7 @@ async fn incoming(
                 permit_transfer(core, &peer.id, clipboard.as_ref())?;
                 if let Some(format) = &clipboard {
                     format.validate(bytes)?;
+                    refuse_while_sharing(core, &peer.id)?;
                 }
                 Uuid::parse_str(&request).map_err(|_| "Invalid transfer ID.")?;
                 let name = safe_file_name(&name)?;
@@ -2034,7 +2041,9 @@ pub(crate) fn share_clipboard_on_switch(core: Arc<Core>, id: String) -> bool {
     tokio::spawn(async move {
         let _share = share;
         if let Err(error) = send_clipboard_content(core.clone(), &id, true).await {
-            if error != "Clipboard has no supported content." {
+            // The peer refuses while its own automatic share runs. Its copy
+            // is on the way here, so there is nothing to report.
+            if error != "Clipboard has no supported content." && error != SHARING_OWN_CLIPBOARD {
                 core.warning(
                     "Flow could not transfer the clipboard. Use Send clipboard to see the reason."
                         .into(),
@@ -2148,7 +2157,7 @@ async fn send_clipboard_content(
                 Some(format),
             )
             .await?;
-            core.clipboard_sync.record(id, vec![digest]);
+            core.clipboard_sync.record(id, vec![digest], false);
             return Ok(true);
         }
     };
@@ -2173,7 +2182,7 @@ async fn send_clipboard_content(
     }
     permit(&core, id, false)?;
     request(&session, wire).await?;
-    core.clipboard_sync.record(id, vec![digest]);
+    core.clipboard_sync.record(id, vec![digest], false);
     Ok(true)
 }
 pub async fn set_control(core: Arc<Core>, id: &str, enabled: bool) -> Result<(), String> {
@@ -2478,18 +2487,10 @@ async fn finish_clipboard(
                 let _ = tokio::fs::remove_dir_all(&kept).await;
                 return Err(error);
             }
+            // The folder stays like any received file: the user may open,
+            // edit or link to these copies. The ledger keeps Flow from
+            // sending the same copy again, so folders appear only for new copies.
             record_received(core, id, files_digest(&paths).await).await;
-            // Only the newest copy from a peer stays on the clipboard. Older
-            // folders would otherwise pile up with every Flow switch.
-            if let Some(previous) = core.clipboard_sync.replace_folder(id, kept.clone()) {
-                let ours = previous
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(is_clipboard_folder_name);
-                if previous != kept && ours {
-                    let _ = tokio::fs::remove_dir_all(previous).await;
-                }
-            }
             Ok(())
         }
     }
@@ -2507,7 +2508,7 @@ async fn record_received(core: &Core, id: &str, received: Option<ClipboardDigest
             }
         }
     }
-    core.clipboard_sync.record(id, synced);
+    core.clipboard_sync.record(id, synced, true);
 }
 
 pub async fn send_file(core: Arc<Core>, id: &str, path: &Path) -> Result<Transfer, String> {
@@ -3638,7 +3639,7 @@ mod tests {
             .filter(|path| {
                 path.file_name()
                     .and_then(|name| name.to_str())
-                    .is_some_and(is_clipboard_folder_name)
+                    .is_some_and(|name| name.starts_with("Clipboard-"))
             })
             .collect()
     }
@@ -3653,7 +3654,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn received_clipboard_is_not_echoed_back_and_old_copies_are_removed() {
+    async fn received_clipboard_is_not_echoed_back_and_copies_are_kept() {
         let (_directory, core, peer) = receiving_fixture();
         allow_clipboard(&core);
         let mut remote = connected_session(&core, &peer, crate::link::PROTOCOL).await;
@@ -3677,15 +3678,17 @@ mod tests {
             Ok(false)
         ));
 
+        let first = clipboard_folders(&core).remove(0).join("a.txt");
         assert_eq!(remote.push(Some(files()), "Clipboard", b"two").await, None);
-        let folders = clipboard_folders(&core);
-        assert_eq!(folders.len(), 1, "only the newest copied files stay");
+        // The user may still use the earlier copy, so it stays.
+        assert_eq!(clipboard_folders(&core).len(), 2);
+        assert_eq!(std::fs::read(&first).unwrap(), b"one");
         let Some(crate::clipboard::Content::Files(paths)) =
             core.clipboard.read(true, usize::MAX).await.unwrap()
         else {
             panic!("the received files should be on the clipboard");
         };
-        assert!(paths[0].starts_with(&folders[0]));
+        assert_ne!(paths[0], first);
         assert_eq!(std::fs::read(&paths[0]).unwrap(), b"two");
         assert!(matches!(
             send_clipboard_content(core.clone(), &peer.id, true).await,
@@ -3710,11 +3713,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sent_clipboard_is_shared_once_until_it_changes() {
+    async fn sent_text_is_shared_on_every_switch() {
         let (_directory, core, peer) = receiving_fixture();
         allow_clipboard(&core);
         let mut remote = connected_session(&core, &peer, crate::link::PROTOCOL).await;
-        for (text, only_if_changed) in [("first", false), ("second", true)] {
+        // The peer may copy something else without this computer seeing it,
+        // so a switch sends the same text again.
+        for (text, only_if_changed) in [("first", false), ("first", true), ("second", true)] {
             core.clipboard
                 .write(crate::clipboard::Content::Text(text.into()))
                 .await
@@ -3739,11 +3744,64 @@ mod tests {
                 })
                 .await;
             assert!(matches!(send.await.unwrap(), Ok(true)));
-            assert!(matches!(
-                send_clipboard_content(core.clone(), &peer.id, true).await,
-                Ok(false)
-            ));
         }
+        remote.sync().await;
+    }
+
+    #[tokio::test]
+    async fn switching_back_during_an_automatic_share_keeps_this_copy() {
+        let (_directory, core, peer) = receiving_fixture();
+        allow_clipboard(&core);
+        let mut remote = connected_session(&core, &peer, crate::link::PROTOCOL).await;
+        core.clipboard
+            .write(crate::clipboard::Content::Text("newer".into()))
+            .await
+            .unwrap();
+        let link = session(&core, &peer.id).unwrap();
+        // This computer's automatic share is still reading its clipboard when
+        // the pointer bounces back and the peer shares its older copy.
+        let share = AutomaticShare::begin(&link.clipboard).unwrap();
+        remote
+            .send(Wire::Clipboard {
+                request: "older".into(),
+                text: "older".into(),
+            })
+            .await;
+        let Some(Wire::Ack { error, .. }) = remote.next().await else {
+            panic!("expected an answer");
+        };
+        assert_eq!(error.as_deref(), Some(SHARING_OWN_CLIPBOARD));
+        remote
+            .send(Wire::FileStart {
+                request: Uuid::new_v4().to_string(),
+                clipboard: Some(ClipboardFormat::Image {
+                    width: 1,
+                    height: 1,
+                }),
+                name: "Clipboard".into(),
+                bytes: 4,
+            })
+            .await;
+        let Some(Wire::Ack { error, .. }) = remote.next().await else {
+            panic!("expected an answer");
+        };
+        assert_eq!(error.as_deref(), Some(SHARING_OWN_CLIPBOARD));
+        assert!(matches!(
+            core.clipboard.read(true, MAX_CLIPBOARD).await,
+            Ok(Some(crate::clipboard::Content::Text(text))) if text == "newer"
+        ));
+
+        drop(share);
+        remote
+            .send(Wire::Clipboard {
+                request: "later".into(),
+                text: "later".into(),
+            })
+            .await;
+        assert!(matches!(
+            remote.next().await,
+            Some(Wire::Ack { error: None, .. })
+        ));
         remote.sync().await;
     }
 
@@ -4033,20 +4091,25 @@ mod tests {
         for file in std::iter::once(&part).chain(&keep) {
             std::fs::write(file, b"x").unwrap();
         }
-        let copied = root.join("Clipboard-abc123");
-        let unrelated = root.join("Clipboard-projects");
-        for folder in [&copied, &unrelated] {
+        // Received copies may be kept, opened or linked to by the user.
+        let folders = [
+            root.join("Clipboard-abc123"),
+            root.join("Clipboard-backup"),
+            root.join("Clipboard-projects"),
+        ];
+        for folder in &folders {
             std::fs::create_dir(folder).unwrap();
             std::fs::write(folder.join("file.txt"), b"x").unwrap();
         }
         let day = Duration::from_secs(24 * 60 * 60);
         // Leftovers of the current run are fresh and stay.
         sweep_receive_folder(root, day, SystemTime::now());
-        assert!(part.exists() && copied.exists());
+        assert!(part.exists());
         sweep_receive_folder(root, day, SystemTime::now() + day + day);
         assert!(!part.exists());
-        assert!(!copied.exists());
-        assert!(unrelated.join("file.txt").exists());
+        assert!(folders
+            .iter()
+            .all(|folder| folder.join("file.txt").exists()));
         assert!(keep.iter().all(|file| file.exists()));
     }
 
