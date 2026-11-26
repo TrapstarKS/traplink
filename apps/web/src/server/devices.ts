@@ -72,8 +72,11 @@ export function registerDevice(db: AppDatabase, token: string, input: Registrati
     if (!user) throw new ApiError(401, 'invalid_enrollment', 'Complete device authorization again.');
     const existing = db.prepare('SELECT * FROM devices WHERE user_id = ? AND installation_id = ?')
       .get(user.id, input.installationId) as DeviceRow | undefined;
-    if (!existing) {
-      const { count } = db.prepare('SELECT count(*) as count FROM devices WHERE user_id = ? AND revoked_at IS NULL').get(user.id) as { count: number };
+    // Only live credentials count. A revoked or expired installation that signs in again is a new live device.
+    const live = existing !== undefined && existing.revoked_at === null && existing.expires_at > now;
+    if (!live) {
+      const { count } = db.prepare('SELECT count(*) as count FROM devices WHERE user_id = ? AND revoked_at IS NULL AND expires_at > ?')
+        .get(user.id, now) as { count: number };
       if (count >= 50) throw new ApiError(409, 'device_limit', 'Revoke an unused device before adding another.');
     }
     const deviceId = existing?.id ?? randomUUID();

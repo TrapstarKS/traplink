@@ -1,5 +1,5 @@
 import { betterAuth } from 'better-auth';
-import { bearer, deviceAuthorization } from 'better-auth/plugins';
+import { deviceAuthorization } from 'better-auth/plugins';
 import type { AppDatabase } from '../server/database';
 import { getDatabase } from '../server/database';
 import { readServerConfig, type ServerConfig } from '../server/config';
@@ -55,6 +55,8 @@ export function createAuth(db: AppDatabase, config: ServerConfig) {
         '/device/token': { window: 60, max: 30 },
       },
     },
+    // No bearer() plugin: the device enrollment token is only redeemed by /api/v1/devices/register,
+    // and must never act as a general session (list/extend/revoke sessions, update the user).
     plugins: [
       deviceAuthorization({
         verificationUri: `${config.baseURL}/device`,
@@ -62,7 +64,6 @@ export function createAuth(db: AppDatabase, config: ServerConfig) {
         expiresIn: '10m',
         interval: '5s',
       }),
-      bearer(),
     ],
   });
 }

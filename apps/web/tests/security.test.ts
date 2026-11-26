@@ -141,6 +141,126 @@ describe('real authentication and device authorization', () => {
     expect(stored.token_hash).toBe(hashToken(result.deviceToken));
     expect(stored.token_hash).not.toContain(result.deviceToken);
   });
+
+  it('does not accept the enrollment token as a general session, and keeps its short expiry', async () => {
+    const token = await enroll(alice);
+    const expiry = () => new Date((db.prepare('SELECT expiresAt FROM session WHERE token = ?').get(token) as { expiresAt: string }).expiresAt).getTime();
+    const initialExpiry = expiry();
+    expect(await auth.api.getSession({ headers: new Headers({ authorization: `Bearer ${token}` }) })).toBeNull();
+    for (const path of ['/get-session', '/list-sessions']) {
+      const response = await handleAuthRequest(new Request(`${config.baseURL}/api/auth${path}`, {
+        headers: { origin: config.baseURL, authorization: `Bearer ${token}` },
+      }), db, config, auth);
+      expect(response.status).not.toBe(200);
+      expect(await response.text()).not.toContain(alice.id);
+    }
+    const revoke = await handleAuthRequest(new Request(`${config.baseURL}/api/auth/revoke-sessions`, {
+      method: 'POST',
+      headers: { origin: config.baseURL, authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: '{}',
+    }), db, config, auth);
+    expect(revoke.status).not.toBe(200);
+    expect((await authRequest('/get-session', undefined, alice.cookie)).status).toBe(200);
+    expect(expiry()).toBe(initialExpiry);
+    expect(expiry() - Date.now()).toBeLessThanOrEqual(10 * 60 * 1000);
+    const result = registerDevice(db, token, registration('Alice enrolled after probing'), config);
+    expect(result.user.id).toBe(alice.id);
+  });
+
+  it('removes expired device codes and unredeemed enrollment sessions without touching live ones', async () => {
+    const stale = await (await authRequest('/device/code', { client_id: 'traplink-desktop' })).json();
+    db.prepare("UPDATE deviceCode SET expiresAt = '2000-01-01T00:00:00.000Z' WHERE userCode = ?").run(stale.user_code);
+    const abandoned = await enroll(bob);
+    db.prepare("UPDATE session SET expiresAt = '2000-01-01T00:00:00.000Z' WHERE token = ?").run(abandoned);
+    const browserSessions = (db.prepare("SELECT count(*) AS count FROM session WHERE kind = 'browser'").get() as { count: number }).count;
+    const fresh = await (await authRequest('/device/code', { client_id: 'traplink-desktop' })).json();
+    const codeCount = (userCode: string) => (db.prepare('SELECT count(*) AS count FROM deviceCode WHERE userCode = ?').get(userCode) as { count: number }).count;
+    expect(codeCount(stale.user_code)).toBe(0);
+    expect(codeCount(fresh.user_code)).toBe(1);
+    expect(db.prepare('SELECT id FROM session WHERE token = ?').get(abandoned)).toBeUndefined();
+    expect((db.prepare("SELECT count(*) AS count FROM session WHERE kind = 'browser'").get() as { count: number }).count).toBe(browserSessions);
+    const result = registerDevice(db, await enroll(alice), registration('Alice after cleanup'), config);
+    expect(result.user.id).toBe(alice.id);
+  });
+
+  it('only sweeps after Better Auth accepts the code request', async () => {
+    const issued: string[] = [];
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const response = await authRequest('/device/code', { client_id: 'traplink-desktop' });
+      expect(response.status).toBe(200);
+      issued.push((await response.json()).user_code);
+    }
+    const stale = issued[0];
+    db.prepare("UPDATE deviceCode SET expiresAt = '2000-01-01T00:00:00.000Z' WHERE userCode = ?").run(stale);
+    const codeCount = () => (db.prepare('SELECT count(*) AS count FROM deviceCode WHERE userCode = ?').get(stale) as { count: number }).count;
+    // Better Auth's /device/code limit (5/min) rejects this one; it must not reach the sweep.
+    expect((await authRequest('/device/code', { client_id: 'traplink-desktop' })).status).toBe(429);
+    expect(codeCount()).toBe(1);
+    db.prepare('DELETE FROM request_limits').run();
+    expect((await authRequest('/device/code', { client_id: 'traplink-desktop' })).status).toBe(200);
+    expect(codeCount()).toBe(0);
+  });
+
+  it('still issues a code when the cleanup sweep fails', async () => {
+    db.exec('ALTER TABLE device_approval_claims RENAME TO device_approval_claims_hidden');
+    try {
+      const response = await authRequest('/device/code', { client_id: 'traplink-desktop' });
+      expect(response.status).toBe(200);
+      expect((await response.json()).user_code).toBeTypeOf('string');
+    } finally {
+      db.exec('ALTER TABLE device_approval_claims_hidden RENAME TO device_approval_claims');
+    }
+  });
+
+  it('reports unknown and expired user codes with the same error code', async () => {
+    const code = await (await authRequest('/device/code', { client_id: 'traplink-desktop' })).json();
+    const typo = `${code.user_code.slice(0, 7)}${code.user_code.endsWith('Z') ? 'Y' : 'Z'}`;
+    const unknown = await authRequest(`/device?user_code=${typo}`, undefined, alice.cookie);
+    expect(unknown.status).toBe(400);
+    expect((await unknown.json()).error).toBe('expired_token');
+    db.prepare("UPDATE deviceCode SET expiresAt = '2000-01-01T00:00:00.000Z' WHERE userCode = ?").run(code.user_code);
+    const expired = await authRequest(`/device?user_code=${code.user_code}`, undefined, alice.cookie);
+    expect(expired.status).toBe(400);
+    expect((await expired.json()).error).toBe('expired_token');
+  });
+});
+
+describe('device limit', () => {
+  function insertDevices(userId: string, count: number, expiresAt: number, revokedAt: number | null = null) {
+    const insert = db.prepare(`INSERT INTO devices (id, user_id, installation_id, name, platform, app_version, public_key, token_hash, created_at, last_seen_at, expires_at, revoked_at)
+      VALUES (?, ?, ?, ?, 'windows', '0.1.0', NULL, ?, ?, ?, ?, ?)`);
+    const ids: string[] = [];
+    for (let index = 0; index < count; index++) {
+      const installationId = randomUUID();
+      insert.run(randomUUID(), userId, installationId, `Filler ${index}`, randomBytes(32).toString('hex'), Date.now(), Date.now(), expiresAt, revokedAt);
+      ids.push(installationId);
+    }
+    return ids;
+  }
+
+  it('does not count expired or revoked credentials toward the limit', async () => {
+    const carol = await signUp('Carol');
+    insertDevices(carol.id, 50, Date.now() - 1);
+    insertDevices(carol.id, 5, Date.now() + 86400_000, Date.now() - 1);
+    const result = registerDevice(db, await enroll(carol), registration('Carol new computer'), config);
+    expect(result.user.id).toBe(carol.id);
+  });
+
+  it('applies the limit when a revoked or expired installation signs in again', async () => {
+    const dave = await signUp('Dave');
+    insertDevices(dave.id, 50, Date.now() + 86400_000);
+    const [revoked] = insertDevices(dave.id, 1, Date.now() + 86400_000, Date.now() - 1);
+    const [expired] = insertDevices(dave.id, 1, Date.now() - 1);
+    for (const installationId of [revoked, expired]) {
+      const input = registrationSchema.parse({ installationId, name: 'Old computer', platform: 'windows', appVersion: '0.1.0' });
+      const token = await enroll(dave);
+      expect(() => registerDevice(db, token, input, config)).toThrow('Revoke an unused device');
+    }
+    const [live] = (db.prepare('SELECT installation_id FROM devices WHERE user_id = ? AND revoked_at IS NULL AND expires_at > ? LIMIT 1').all(dave.id, Date.now()) as { installation_id: string }[]).map(row => row.installation_id);
+    const rotated = registerDevice(db, await enroll(dave), registrationSchema.parse({ installationId: live, name: 'Still here', platform: 'windows', appVersion: '0.1.0' }), config);
+    expect(rotated.user.id).toBe(dave.id);
+    expect((db.prepare('SELECT count(*) AS count FROM devices WHERE user_id = ? AND revoked_at IS NULL AND expires_at > ?').get(dave.id, Date.now()) as { count: number }).count).toBe(50);
+  });
 });
 
 describe('tenant isolation and credential revocation', () => {
