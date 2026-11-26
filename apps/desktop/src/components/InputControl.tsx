@@ -4,8 +4,11 @@ import { Kbd } from "@/components/ui/kbd";
 import { Spinner } from "@/components/ui/spinner";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
-import { messageFrom, nativeCommand, type ConnectedPeer } from "@/lib/bridge";
+import { ConfirmDialog } from "@/components/common";
+import { messageFrom, nativeCommand, type ConnectedPeer, type DesktopSnapshot } from "@/lib/bridge";
 import { allowLocally, askPeerForInput } from "@/lib/permissions";
+import { maskedGrantRevocations, needsInputGrantDisclosure, revocationNotice } from "@/lib/permission-rules";
+import { singleFlight } from "@/lib/single-flight";
 
 type InputEvent = { type: "key"; key: string; down: boolean } | { type: "move"; x: number; y: number } | { type: "button"; button: number; down: boolean } | { type: "scroll"; x: number; y: number };
 
@@ -13,6 +16,8 @@ export function InputControl({ peer, enabled, onPermissionsChanged }: { peer: Co
   const [active, setActive] = useState(false);
   const [starting, setStarting] = useState(false);
   const [waiting, setWaiting] = useState(false);
+  const [confirmingGrant, setConfirmingGrant] = useState<{ revokes: string | null } | null>(null);
+  const [checking] = useState(singleFlight);
   const pane = useRef<HTMLDivElement>(null);
   const activeRef = useRef(false);
   const animationFrame = useRef<number | null>(null);
@@ -39,6 +44,19 @@ export function InputControl({ peer, enabled, onPermissionsChanged }: { peer: Co
     }).catch(error => { if (activeRef.current) { stop(); toast.error(messageFrom(error)); } });
   }, [peer.id, stop]);
 
+  // Control uses one pair permission, so starting it also lets the peer control this computer.
+  // The guard keeps a double click from sending two requests while the snapshot is read.
+  const requestStart = () => checking(async () => {
+    let disclose: boolean;
+    let revokes: string | null;
+    try {
+      const snapshot = await nativeCommand<DesktopSnapshot>("get_snapshot");
+      disclose = needsInputGrantDisclosure(snapshot.peers.find(item => item.id === peer.id), snapshot.settings);
+      revokes = revocationNotice(snapshot.peers, maskedGrantRevocations(snapshot.peers, peer.id, snapshot.settings, ["input"]), "before");
+    } catch (error) { if (mounted.current) toast.error(messageFrom(error)); return; }
+    if (!mounted.current) return;
+    if (disclose) setConfirmingGrant({ revokes }); else await start();
+  });
   async function start() {
     const request = ++generation.current;
     setStarting(true);
@@ -47,7 +65,8 @@ export function InputControl({ peer, enabled, onPermissionsChanged }: { peer: Co
       let answer: "granted" | "outdated";
       try { answer = await askPeerForInput(peer.id, false); } finally { if (mounted.current) setWaiting(false); }
       if (!mounted.current || generation.current !== request) return;
-      await allowLocally(peer.id, ["input"]);
+      const notice = await allowLocally(peer.id, ["input"]);
+      if (notice && mounted.current) toast.warning(notice);
       await onPermissionsChanged();
       if (!mounted.current || generation.current !== request) return;
       if (answer === "outdated") toast.info(`${peer.name} runs an older TrapLink. If control is refused, allow mouse and keyboard there.`);
@@ -94,5 +113,5 @@ export function InputControl({ peer, enabled, onPermissionsChanged }: { peer: Co
     };
   }, [peer.id]);
 
-  return <section className="input-control">{active ? <><div ref={pane} tabIndex={0} role="application" aria-label={`Controlling ${peer.name}. Press Escape to stop.`} className="input-control-pane" onBlur={stop} onContextMenu={event => event.preventDefault()} onKeyDown={event => { event.preventDefault(); event.stopPropagation(); if (event.code === "Escape") { stop(); return; } if (!event.repeat) send({ type: "key", key: event.code, down: true }); }} onKeyUp={event => { event.preventDefault(); event.stopPropagation(); if (event.code !== "Escape") send({ type: "key", key: event.code, down: false }); }} onPointerMove={event => { const rect = event.currentTarget.getBoundingClientRect(); pendingMove.current = { type: "move", x: Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width)), y: Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height)) }; if (animationFrame.current === null) animationFrame.current = requestAnimationFrame(() => { animationFrame.current = null; if (pendingMove.current) send(pendingMove.current); pendingMove.current = null; }); }} onPointerDown={event => { event.preventDefault(); event.currentTarget.setPointerCapture(event.pointerId); event.currentTarget.focus(); if (event.button <= 2) send({ type: "button", button: event.button, down: true }); }} onPointerUp={event => { if (event.button <= 2) send({ type: "button", button: event.button, down: false }); if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId); }} onPointerCancel={stop}><MousePointer2 /><strong>Controlling {peer.name}</strong><span>Move the mouse, click or type in this area</span><span className="input-control-exit"><Kbd>Esc</Kbd> to stop</span></div><Button variant="destructive" onClick={stop}><Square data-icon="inline-start" />Stop control</Button></> : <><Button variant="outline" disabled={!enabled || !peer.connected || starting} onClick={() => void start()}>{starting ? <Spinner data-icon="inline-start" /> : <MousePointer2 data-icon="inline-start" />}{waiting ? `Waiting for permission on ${peer.name}…` : "Start control"}</Button><p className="input-control-note">Control {peer.name} from an area of this window. Esc stops.</p></>}</section>;
+  return <section className="input-control">{active ? <><div ref={pane} tabIndex={0} role="application" aria-label={`Controlling ${peer.name}. Press Escape to stop.`} className="input-control-pane" onBlur={stop} onContextMenu={event => event.preventDefault()} onKeyDown={event => { event.preventDefault(); event.stopPropagation(); if (event.code === "Escape") { stop(); return; } if (!event.repeat) send({ type: "key", key: event.code, down: true }); }} onKeyUp={event => { event.preventDefault(); event.stopPropagation(); if (event.code !== "Escape") send({ type: "key", key: event.code, down: false }); }} onPointerMove={event => { const rect = event.currentTarget.getBoundingClientRect(); pendingMove.current = { type: "move", x: Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width)), y: Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height)) }; if (animationFrame.current === null) animationFrame.current = requestAnimationFrame(() => { animationFrame.current = null; if (pendingMove.current) send(pendingMove.current); pendingMove.current = null; }); }} onPointerDown={event => { event.preventDefault(); event.currentTarget.setPointerCapture(event.pointerId); event.currentTarget.focus(); if (event.button <= 2) send({ type: "button", button: event.button, down: true }); }} onPointerUp={event => { if (event.button <= 2) send({ type: "button", button: event.button, down: false }); if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId); }} onPointerCancel={stop}><MousePointer2 /><strong>Controlling {peer.name}</strong><span>Move the mouse, click or type in this area</span><span className="input-control-exit"><Kbd>Esc</Kbd> to stop</span></div><Button variant="destructive" onClick={stop}><Square data-icon="inline-start" />Stop control</Button></> : <><Button variant="outline" disabled={!enabled || !peer.connected || starting} onClick={() => void requestStart()}>{starting ? <Spinner data-icon="inline-start" /> : <MousePointer2 data-icon="inline-start" />}{waiting ? `Waiting for permission on ${peer.name}…` : "Start control"}</Button><p className="input-control-note">Control {peer.name} from an area of this window. Esc stops. Starting also lets {peer.name} control this computer.</p><ConfirmDialog open={!!confirmingGrant} onOpenChange={open => { if (!open) setConfirmingGrant(null); }} title={`Let ${peer.name} control this computer too?`} description={`Starting control also lets ${peer.name} control this computer without asking. You can turn this off in Permissions for ${peer.name}.${confirmingGrant?.revokes ? ` ${confirmingGrant.revokes}` : ""}`} action="Start control" onConfirm={() => { setConfirmingGrant(null); void checking(start); }} /></>}</section>;
 }

@@ -251,9 +251,11 @@ function PeerDialog({ desktop, peer, onClose }: { desktop: Desktop; peer: Connec
   async function setPermission(key: PeerFeature, value: boolean) {
     setSaving(key);
     try {
-      if (value) await allowLocally(peer.id, [key]); else await revokeForPeer(peer, key);
+      let notice: string | null = null;
+      if (value) notice = await allowLocally(peer.id, [key]); else await revokeForPeer(peer, key);
       await refresh();
       toast.success(`${value ? permissionCopy[key].on : permissionCopy[key].off} ${peer.name}.`);
+      if (notice) toast.warning(notice);
     } catch (error) { toast.error(messageFrom(error)); }
     finally { setSaving(null); }
   }
