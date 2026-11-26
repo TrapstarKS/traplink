@@ -10,14 +10,15 @@ use base64::{
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet, VecDeque},
+    hash::Hasher,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU32, Ordering},
-        Arc,
+        Arc, Mutex,
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -35,6 +36,13 @@ const INVITATION_PREFIX: &str = "traplink:v1:";
 const MAX_INVITATION_LENGTH: usize = 2048;
 const MAX_INVITATION_CANDIDATES: usize = 8;
 const INVITATION_LIFETIME: Duration = Duration::from_secs(300);
+// The joining computer checks the expiry against its own clock. The inviting
+// computer still enforces the real lifetime with its monotonic clock.
+const INVITATION_CLOCK_SKEW: Duration = Duration::from_secs(120);
+// Leftovers from a crash or forced restart are removed on a later start.
+const STALE_RECEIVE_FILES: Duration = Duration::from_secs(24 * 60 * 60);
+// Bounds the memory used to recognize transfers a peer has already refused.
+const REFUSED_TRANSFERS: usize = 32;
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(12);
 const DIRECT_ATTEMPT: Duration = Duration::from_secs(4);
 const PROBE_TIMEOUT: Duration = Duration::from_millis(700);
@@ -76,7 +84,9 @@ fn decode_invitation(invitation: &str, now: i64) -> Result<ParsedInvitation, Str
     if encoded.expires_at <= now {
         return Err("This invitation has expired. Create a new one on the other computer.".into());
     }
-    if encoded.expires_at > now.saturating_add(INVITATION_LIFETIME.as_secs() as i64) {
+    if encoded.expires_at
+        > now.saturating_add((INVITATION_LIFETIME + INVITATION_CLOCK_SKEW).as_secs() as i64)
+    {
         return Err("The invitation expiry is invalid. Check both computer clocks and create a new invitation.".into());
     }
     if encoded.candidates.is_empty() || encoded.candidates.len() > MAX_INVITATION_CANDIDATES {
@@ -139,6 +149,9 @@ pub struct Session {
     pub rtt_ms: Arc<AtomicU32>,
     pub farewell: Arc<AtomicBool>,
     pub protocol: u32,
+    pub(crate) clipboard: Arc<ClipboardActivity>,
+    /// Outgoing transfers the peer refused after accepting them, with its reason.
+    refused: Arc<Mutex<VecDeque<(String, String)>>>,
 }
 impl Session {
     pub fn new(tx: mpsc::Sender<Outgoing>, cancel: watch::Sender<bool>, generation: Uuid) -> Self {
@@ -149,6 +162,8 @@ impl Session {
             rtt_ms: Arc::new(AtomicU32::new(0)),
             farewell: Arc::new(AtomicBool::new(false)),
             protocol: crate::link::PROTOCOL,
+            clipboard: Default::default(),
+            refused: Default::default(),
         }
     }
     fn stop_untagged(&self) {
@@ -179,6 +194,200 @@ impl Session {
 pub struct Outgoing {
     pub message: Wire,
     pub result: Option<oneshot::Sender<Result<(), String>>>,
+}
+
+fn note_refusal(refused: &Mutex<VecDeque<(String, String)>>, request: String, error: String) {
+    if let Ok(mut refused) = refused.lock() {
+        if refused.len() >= REFUSED_TRANSFERS {
+            refused.pop_front();
+        }
+        refused.push_back((request, error));
+    }
+}
+fn take_refusal(refused: &Mutex<VecDeque<(String, String)>>, request: &str) -> Option<String> {
+    let mut refused = refused.lock().ok()?;
+    let index = refused.iter().position(|(id, _)| id == request)?;
+    refused.remove(index).map(|(_, error)| error)
+}
+
+/// Clipboard work in flight on one connection.
+#[derive(Default)]
+pub(crate) struct ClipboardActivity {
+    /// The peer is sending a copied file list or image that is not on the clipboard yet.
+    incoming: AtomicBool,
+    /// An automatic share to the peer is running.
+    outgoing: AtomicBool,
+}
+
+/// Holds the automatic-share slot of a connection until the send ends.
+struct AutomaticShare(Arc<ClipboardActivity>);
+impl AutomaticShare {
+    fn begin(activity: &Arc<ClipboardActivity>) -> Option<Self> {
+        // The copy that is still arriving is newer than this computer's
+        // clipboard. Sending now would overwrite the peer's newer copy.
+        if activity.incoming.load(Ordering::SeqCst) {
+            return None;
+        }
+        activity
+            .outgoing
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()?;
+        Some(Self(activity.clone()))
+    }
+}
+impl Drop for AutomaticShare {
+    fn drop(&mut self) {
+        self.0.outgoing.store(false, Ordering::SeqCst);
+    }
+}
+
+/// The reply to a clipboard the peer sends while this computer's automatic
+/// share to it runs. Automatic shares on the peer ignore it.
+const SHARING_OWN_CLIPBOARD: &str = "The other computer is sharing its clipboard right now.";
+/// Refuses a clipboard from `id` while this computer's automatic share to it
+/// runs. Switching back quickly would otherwise swap the two clipboards: the
+/// peer's older copy lands here before this copy reaches the peer.
+fn refuse_while_sharing(core: &Core, id: &str) -> Result<(), String> {
+    match session(core, id) {
+        Ok(link) if link.clipboard.outgoing.load(Ordering::SeqCst) => {
+            Err(SHARING_OWN_CLIPBOARD.into())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Identifies clipboard content without keeping it.
+#[derive(Clone, PartialEq, Eq)]
+enum ClipboardDigest {
+    Text(u64),
+    Image {
+        width: usize,
+        height: usize,
+        hash: u64,
+    },
+    Files(Vec<(PathBuf, u64, Option<SystemTime>)>),
+}
+fn hash_bytes(bytes: &[u8]) -> u64 {
+    let mut hasher = std::hash::DefaultHasher::new();
+    hasher.write(bytes);
+    hasher.finish()
+}
+async fn image_digest(
+    width: usize,
+    height: usize,
+    rgba: Vec<u8>,
+) -> Result<(Vec<u8>, ClipboardDigest), String> {
+    tokio::task::spawn_blocking(move || {
+        let hash = hash_bytes(&rgba);
+        (
+            rgba,
+            ClipboardDigest::Image {
+                width,
+                height,
+                hash,
+            },
+        )
+    })
+    .await
+    .map_err(|_| "Clipboard task failed.".to_string())
+}
+async fn files_digest(paths: &[PathBuf]) -> Option<ClipboardDigest> {
+    let mut files = Vec::with_capacity(paths.len());
+    for path in paths {
+        let meta = tokio::fs::metadata(path).await.ok()?;
+        files.push((path.clone(), meta.len(), meta.modified().ok()));
+    }
+    Some(ClipboardDigest::Files(files))
+}
+async fn content_digest(content: crate::clipboard::Content) -> Option<ClipboardDigest> {
+    use crate::clipboard::Content;
+    match content {
+        Content::Text(text) => Some(ClipboardDigest::Text(hash_bytes(text.as_bytes()))),
+        Content::Image {
+            width,
+            height,
+            rgba,
+        } => image_digest(width, height, rgba).await.ok().map(|(_, d)| d),
+        Content::Files(paths) => files_digest(&paths).await,
+    }
+}
+
+#[derive(Default)]
+struct PeerClipboard {
+    /// Content both computers hold after the last transfer between them.
+    synced: Vec<ClipboardDigest>,
+    /// Whether that transfer came from the peer. This computer reads its own
+    /// clipboard, so it knows that copy is still here. A copy it sent may
+    /// since have been replaced on the peer without TrapLink seeing it.
+    received: bool,
+}
+
+/// Remembers per peer what the last clipboard transfer left on both computers.
+#[derive(Default)]
+pub struct ClipboardLedger(Mutex<HashMap<String, PeerClipboard>>);
+impl ClipboardLedger {
+    /// Whether an automatic share of `digest` to `peer` can be skipped. Text
+    /// this computer sent is always sent again: it is small, and the peer may
+    /// hold another copy by now. Text that came from the peer is not echoed.
+    fn is_synced(&self, peer: &str, digest: &ClipboardDigest) -> bool {
+        self.0.lock().is_ok_and(|peers| {
+            peers.get(peer).is_some_and(|p| {
+                p.synced.contains(digest)
+                    && (p.received || !matches!(digest, ClipboardDigest::Text(_)))
+            })
+        })
+    }
+    fn record(&self, peer: &str, synced: Vec<ClipboardDigest>, received: bool) {
+        if let Ok(mut peers) = self.0.lock() {
+            peers.insert(peer.to_owned(), PeerClipboard { synced, received });
+        }
+    }
+}
+
+/// Matches only the names TrapLink gives its own temporary receive files.
+fn is_partial_name(name: &str) -> bool {
+    name.strip_prefix('.')
+        .and_then(|name| name.strip_suffix(".part"))
+        .and_then(|id| Uuid::parse_str(id).ok().map(|uuid| uuid.to_string() == id))
+        .unwrap_or(false)
+}
+/// Removes TrapLink's own partial `.<uuid>.part` files older than
+/// `older_than` from the receive folder. Copied-file folders, symbolic links
+/// and every other entry are left alone: users may keep received copies.
+fn sweep_receive_folder(directory: &Path, older_than: Duration, now: SystemTime) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        let old = meta
+            .modified()
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age >= older_than);
+        let name = entry.file_name();
+        let Some(name) = name.to_str().filter(|_| old) else {
+            continue;
+        };
+        if meta.file_type().is_file() && is_partial_name(name) {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+fn receive_folder(core: &Core) -> Result<PathBuf, String> {
+    Ok(PathBuf::from(
+        core.data
+            .lock()
+            .map_err(|_| "Settings lock unavailable.")?
+            .settings
+            .download_directory
+            .clone(),
+    )
+    .join("TrapLink"))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -226,6 +435,7 @@ impl ClipboardFormat {
                 !files.is_empty()
                     && files.len() <= 32
                     && files.iter().all(|(name, _)| safe_file_name(name).is_ok())
+                    && distinct_names(files.iter().map(|(name, _)| name.as_str()))
                     && files
                         .iter()
                         .try_fold(0u64, |total, (_, n)| total.checked_add(*n))
@@ -238,6 +448,15 @@ impl ClipboardFormat {
             Err("Invalid clipboard dimensions, file list or size (maximum 128 MiB).".into())
         }
     }
+}
+
+/// Copied files land in one folder, and Windows and macOS folders usually
+/// ignore letter case.
+fn distinct_names<'a>(names: impl IntoIterator<Item = &'a str>) -> bool {
+    let mut seen = HashSet::new();
+    names
+        .into_iter()
+        .all(|name| seen.insert(name.to_lowercase()))
 }
 
 fn permit_transfer(core: &Core, id: &str, format: Option<&ClipboardFormat>) -> Result<(), String> {
@@ -1005,6 +1224,11 @@ pub async fn listen(core: Arc<Core>) {
     if core.identity.is_none() {
         return;
     }
+    if let Some(folder) = receive_folder(&core).ok().filter(|f| f.is_absolute()) {
+        tokio::task::spawn_blocking(move || {
+            sweep_receive_folder(&folder, STALE_RECEIVE_FILES, SystemTime::now())
+        });
+    }
     let permits = Arc::new(Semaphore::new(8));
     loop {
         let port = core.data.lock().map(|d| d.settings.port).unwrap_or(48372);
@@ -1152,6 +1376,68 @@ impl Drop for IncomingFile {
     }
 }
 
+/// Moves a received file to its final name without ever replacing an existing
+/// file. `link` is normally `std::fs::hard_link`.
+fn finalize_with(
+    link: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+    temporary: &Path,
+    destination: &Path,
+) -> std::io::Result<()> {
+    match link(temporary, destination) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(temporary);
+            return Ok(());
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Err(error),
+        Err(_) => {}
+    }
+    // FAT, exFAT and some network folders have no hard links. Claim the name
+    // first, so the rename can only replace TrapLink's own empty placeholder.
+    drop(
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(destination)?,
+    );
+    std::fs::rename(temporary, destination).inspect_err(|_| {
+        let _ = std::fs::remove_file(destination);
+    })
+}
+
+/// Lets a test hold a received file just before it is synced and finalized.
+#[cfg(test)]
+mod test_hold {
+    use std::{
+        path::{Path, PathBuf},
+        sync::{Arc, Mutex},
+    };
+    use tokio::sync::Semaphore;
+
+    static HOLDS: Mutex<Vec<(PathBuf, Arc<Semaphore>)>> = Mutex::new(Vec::new());
+
+    /// Holds files received under `directory` until the test adds a permit.
+    pub fn hold(directory: &Path) -> Arc<Semaphore> {
+        let gate = Arc::new(Semaphore::new(0));
+        HOLDS
+            .lock()
+            .unwrap()
+            .push((directory.to_path_buf(), gate.clone()));
+        gate
+    }
+
+    pub async fn wait(file: &Path) {
+        let gate = HOLDS
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(directory, _)| file.starts_with(directory))
+            .map(|(_, gate)| gate.clone());
+        if let Some(gate) = gate {
+            let _ = gate.acquire().await;
+        }
+    }
+}
+
 struct OutgoingTransferGuard {
     core: Arc<Core>,
     session: Arc<Session>,
@@ -1282,6 +1568,7 @@ async fn incoming(
         Wire::InputKeepalive => incoming_input(core, peer, None, FlowPacket::Keepalive),
         Wire::Clipboard { request, text } => {
             let result = permit(core, &peer.id, false).and_then(|_| {
+                refuse_while_sharing(core, &peer.id)?;
                 if text.len() <= MAX_CLIPBOARD {
                     Ok(())
                 } else {
@@ -1289,9 +1576,15 @@ async fn incoming(
                 }
             });
             let result = if result.is_ok() {
-                core.clipboard
+                let digest = ClipboardDigest::Text(hash_bytes(text.as_bytes()));
+                let written = core
+                    .clipboard
                     .write(crate::clipboard::Content::Text(text))
-                    .await
+                    .await;
+                if written.is_ok() {
+                    core.clipboard_sync.record(&peer.id, vec![digest], true);
+                }
+                written
             } else {
                 result
             };
@@ -1310,21 +1603,14 @@ async fn incoming(
                 permit_transfer(core, &peer.id, clipboard.as_ref())?;
                 if let Some(format) = &clipboard {
                     format.validate(bytes)?;
+                    refuse_while_sharing(core, &peer.id)?;
                 }
                 Uuid::parse_str(&request).map_err(|_| "Invalid transfer ID.")?;
                 let name = safe_file_name(&name)?;
                 if bytes > MAX_FILE || files.len() >= 2 || files.contains_key(&request) {
                     return Err("File exceeds 128 MiB or too many transfers are active.".into());
                 }
-                let directory = PathBuf::from(
-                    core.data
-                        .lock()
-                        .map_err(|_| "Settings lock unavailable.")?
-                        .settings
-                        .download_directory
-                        .clone(),
-                )
-                .join("TrapLink");
+                let directory = receive_folder(core)?;
                 tokio::fs::create_dir_all(&directory)
                     .await
                     .map_err(|e| format!("Cannot create receive folder: {e}"))?;
@@ -1403,16 +1689,25 @@ async fn incoming(
                     return Err("Received file length did not match the declared size.".into());
                 }
                 let mut handle = file.file.take().ok_or("Received file is closed.")?;
+                #[cfg(test)]
+                test_hold::wait(&file.temporary).await;
                 handle.flush().await.map_err(|e| e.to_string())?;
                 handle.sync_all().await.map_err(|e| e.to_string())?;
                 drop(handle);
                 if let Some(format) = &file.clipboard {
                     return finish_clipboard(core, &peer.id, &file.temporary, format).await;
                 }
-                tokio::fs::hard_link(&file.temporary, &file.destination)
-                    .await
-                    .map_err(|e| format!("Cannot finalize received file: {e}"))?;
-                let _ = tokio::fs::remove_file(&file.temporary).await;
+                let (temporary, destination) = (file.temporary.clone(), file.destination.clone());
+                tokio::task::spawn_blocking(move || {
+                    finalize_with(
+                        |from, to| std::fs::hard_link(from, to),
+                        &temporary,
+                        &destination,
+                    )
+                })
+                .await
+                .map_err(|_| "Cannot finalize received file.".to_string())?
+                .map_err(|e| format!("Cannot finalize received file: {e}"))?;
                 Ok(())
             }
             .await;
@@ -1529,6 +1824,7 @@ async fn run_session(
 ) {
     let (generation, protocol) = (session.generation, session.protocol);
     let (rtt, farewell) = (session.rtt_ms.clone(), session.farewell.clone());
+    let (clipboard, refused) = (session.clipboard.clone(), session.refused.clone());
     // Let closing the last owning session also close its outgoing channel.
     drop(session);
     let probing = protocol >= crate::link::PROBING;
@@ -1545,7 +1841,13 @@ async fn run_session(
     });
     let mut pending: HashMap<String, oneshot::Sender<Result<(), String>>> = HashMap::new();
     let mut files: HashMap<String, IncomingFile> = HashMap::new();
-    let mut clipboard_commit = tokio::task::JoinSet::new();
+    // Finishing a received file syncs it to disk, and a clipboard transfer may
+    // also encode a large bitmap. Both run here so the loop keeps serving
+    // input and probes. Each task returns whether it was a clipboard transfer.
+    let mut commits = tokio::task::JoinSet::new();
+    let mut clipboard_commits = 0usize;
+    // Transfers this side already refused. Their remaining chunks get no reply.
+    let mut refused_chunks: VecDeque<String> = VecDeque::new();
     let mut heartbeat = tokio::time::interval(if probing {
         crate::link::PROBE_INTERVAL
     } else {
@@ -1561,6 +1863,10 @@ async fn run_session(
             break;
         }
         pending.retain(|_, result| !result.is_closed());
+        clipboard.incoming.store(
+            clipboard_commits > 0 || files.values().any(|file| file.clipboard.is_some()),
+            Ordering::SeqCst,
+        );
         tokio::select! {
             _ = cancel.changed() => break,
             _ = transfer_cleanup.tick() => expire_incoming(&core, &mut files, Instant::now()),
@@ -1576,9 +1882,12 @@ async fn run_session(
                 };
                 if write_wire(&mut writer, &mut noise, &message).await.is_err() { break; }
             },
-            Some(reply) = clipboard_commit.join_next(), if !clipboard_commit.is_empty() => {
+            Some(reply) = commits.join_next(), if !commits.is_empty() => {
                 match reply {
-                    Ok(Some(ack)) => if write_wire(&mut writer, &mut noise, &ack).await.is_err() { break; },
+                    Ok((was_clipboard, Some(ack))) => {
+                        if was_clipboard { clipboard_commits -= 1; }
+                        if write_wire(&mut writer, &mut noise, &ack).await.is_err() { break; }
+                    }
                     _ => break,
                 }
             }
@@ -1587,7 +1896,14 @@ async fn run_session(
                 let Some(Ok(frame)) = next else { break; };
                 let Ok(wire) = decrypt(&mut noise, &frame) else { break; }; last_message = Instant::now();
                 match wire {
-                    Wire::Ack { request, error } => { if let Some(sender) = pending.remove(&request) { let _ = sender.send(error.map_or(Ok(()), Err)); } },
+                    Wire::Ack { request, error } => {
+                        if let Some(sender) = pending.remove(&request) {
+                            let _ = sender.send(error.map_or(Ok(()), Err));
+                        } else if let Some(error) = error {
+                            // A refused file chunk. Let the sender stop streaming.
+                            note_refusal(&refused, request, error);
+                        }
+                    },
                     Wire::Probe { id } => { if write_wire(&mut writer, &mut noise, &Wire::ProbeReply { id }).await.is_err() { break; } },
                     Wire::ProbeReply { id } => {
                         if let Some((_, sent_at)) = probe.filter(|(sent, _)| *sent == id) {
@@ -1600,21 +1916,37 @@ async fn run_session(
                         crate::flow::remote_closed(&core, &peer.id);
                         break;
                     },
-                    Wire::FileEnd { request } if files.get(&request).is_some_and(|file| file.clipboard.is_some()) => {
-                        // Encoding a large native bitmap or unpacking a file list can take
+                    Wire::FileEnd { request } if files.contains_key(&request) => {
+                        // Syncing a large file or encoding a native bitmap can take
                         // longer than the input lease. Keep serving motion and probes.
                         if let Some(file) = files.remove(&request) {
-                            if clipboard_commit.is_empty() {
+                            let is_clipboard = file.clipboard.is_some();
+                            if !is_clipboard || clipboard_commits == 0 {
+                                clipboard_commits += usize::from(is_clipboard);
                                 let (core, peer) = (core.clone(), peer.clone());
-                                clipboard_commit.spawn(async move {
+                                commits.spawn(async move {
                                     let mut staged = HashMap::from([(request.clone(), file)]);
-                                    incoming(&core, &peer, Wire::FileEnd { request }, &mut staged).await
+                                    (is_clipboard, incoming(&core, &peer, Wire::FileEnd { request }, &mut staged).await)
                                 });
                             } else {
                                 core.transfer_status(&request, "failed");
                                 let reply = Wire::Ack { request, error: Some("Another clipboard transfer is finishing.".into()) };
                                 if write_wire(&mut writer, &mut noise, &reply).await.is_err() { break; }
                             }
+                        }
+                    }
+                    Wire::FileStart { request, .. } if files.len() + commits.len() >= 2 => {
+                        let reply = Wire::Ack { request, error: Some("File exceeds 128 MiB or too many transfers are active.".into()) };
+                        if write_wire(&mut writer, &mut noise, &reply).await.is_err() { break; }
+                    }
+                    Wire::FileChunk { request, .. } if refused_chunks.contains(&request) => {}
+                    Wire::FileChunk { request, data } => {
+                        let chunk = Wire::FileChunk { request: request.clone(), data };
+                        if let Some(reply) = incoming(&core, &peer, chunk, &mut files).await {
+                            // Answer a refused transfer once instead of once per chunk.
+                            if refused_chunks.len() >= REFUSED_TRANSFERS { refused_chunks.pop_front(); }
+                            refused_chunks.push_back(request);
+                            if write_wire(&mut writer, &mut noise, &reply).await.is_err() { break; }
                         }
                     }
                     wire => { if let Some(reply) = incoming(&core, &peer, wire, &mut files).await { if write_wire(&mut writer, &mut noise, &reply).await.is_err() { break; } } }
@@ -1639,9 +1971,8 @@ async fn run_session(
         .await;
     }
     reader_task.abort();
-    for id in files.keys() {
-        core.transfer_status(id, "failed");
-    }
+    release_transfers(&core, files, commits);
+    clipboard.incoming.store(false, Ordering::SeqCst);
     for (_, result) in pending {
         let _ = result.send(Err("Peer disconnected.".into()));
     }
@@ -1657,6 +1988,20 @@ async fn run_session(
             }
         }
     }
+}
+/// Ends the incoming transfers of a closed connection.
+fn release_transfers<T: 'static>(
+    core: &Core,
+    files: HashMap<String, IncomingFile>,
+    mut commits: tokio::task::JoinSet<T>,
+) {
+    for id in files.keys() {
+        core.transfer_status(id, "failed");
+    }
+    // A transfer that is already finishing records its own result. Dropping it
+    // would leave it "receiving" and could delete files the clipboard already
+    // lists. It checks permissions again before it touches the clipboard.
+    commits.detach_all();
 }
 pub(super) fn session(core: &Core, id: &str) -> Result<Arc<Session>, String> {
     core.sessions
@@ -1686,10 +2031,22 @@ async fn request_within(session: &Session, message: Wire, limit: Duration) -> Re
         .await
         .map_err(|_| "Peer did not acknowledge the request.".to_string())?
 }
-pub(crate) fn share_clipboard_on_switch(core: Arc<Core>, id: String) {
+/// Sends the clipboard to `id` when control switches, unless the peer already
+/// holds the same content or a newer copy is on its way here. Returns whether
+/// a send started.
+pub(crate) fn share_clipboard_on_switch(core: Arc<Core>, id: String) -> bool {
+    let Ok(link) = session(&core, &id) else {
+        return false;
+    };
+    let Some(share) = AutomaticShare::begin(&link.clipboard) else {
+        return false;
+    };
     tokio::spawn(async move {
-        if let Err(error) = send_clipboard(core.clone(), &id).await {
-            if error != "Clipboard has no supported content." {
+        let _share = share;
+        if let Err(error) = send_clipboard_content(core.clone(), &id, true).await {
+            // The peer refuses while its own automatic share runs. Its copy
+            // is on the way here, so there is nothing to report.
+            if error != "Clipboard has no supported content." && error != SHARING_OWN_CLIPBOARD {
                 core.warning(
                     "Flow could not transfer the clipboard. Use Send clipboard to see the reason."
                         .into(),
@@ -1697,75 +2054,104 @@ pub(crate) fn share_clipboard_on_switch(core: Arc<Core>, id: String) {
             }
         }
     });
+    true
 }
 
 pub async fn send_clipboard(core: Arc<Core>, id: &str) -> Result<(), String> {
+    send_clipboard_content(core, id, false).await.map(|_| ())
+}
+
+/// Sends the clipboard and records it as held by both computers. With
+/// `only_if_changed`, content the peer already holds is skipped and the
+/// result is `Ok(false)`.
+async fn send_clipboard_content(
+    core: Arc<Core>,
+    id: &str,
+    only_if_changed: bool,
+) -> Result<bool, String> {
     permit(&core, id, false)?;
     let session = session(&core, id)?;
     use crate::clipboard::Content;
+    let rich = session.protocol >= crate::link::RICH_CLIPBOARD;
     let content = core
         .clipboard
-        .read()
+        .read(rich, MAX_CLIPBOARD)
         .await?
         .ok_or("Clipboard has no supported content.")?;
     let text = match content {
         Content::Text(text) => text,
         content => {
-            if session.protocol < crate::link::RICH_CLIPBOARD {
+            if !rich {
                 return Err(
                     "Update TrapLink on both computers to share copied files and images.".into(),
                 );
             }
-            let (format, reader, bytes): (_, Box<dyn AsyncRead + Unpin + Send>, u64) = match content
-            {
-                Content::Files(paths) => {
-                    permit(&core, id, true)?;
-                    if paths.len() > 32 {
-                        return Err("Copy up to 32 regular files at a time.".into());
-                    }
-                    let mut entries = Vec::new();
-                    let mut total = 0u64;
-                    let mut reader: Box<dyn AsyncRead + Unpin + Send> =
-                        Box::new(tokio::io::empty());
-                    for path in paths {
-                        let name = safe_file_name(
-                            path.file_name()
-                                .and_then(|n| n.to_str())
-                                .ok_or("Invalid file name.")?,
-                        )?;
-                        let file = tokio::fs::File::open(&path)
-                            .await
-                            .map_err(|_| "Cannot open copied file.")?;
-                        let meta = file
-                            .metadata()
-                            .await
-                            .map_err(|_| "Cannot inspect copied file.")?;
-                        if !meta.is_file() || meta.len() > MAX_FILE - total {
-                            return Err("Copy regular files totaling at most 128 MiB.".into());
+            let (format, reader, bytes, digest): (_, Box<dyn AsyncRead + Unpin + Send>, u64, _) =
+                match content {
+                    Content::Files(paths) => {
+                        permit(&core, id, true)?;
+                        if paths.len() > 32 {
+                            return Err("Copy up to 32 regular files at a time.".into());
                         }
-                        total += meta.len();
-                        entries.push((name, meta.len()));
-                        reader = Box::new(reader.chain(file.take(meta.len())));
+                        let mut entries = Vec::new();
+                        let mut sources = Vec::new();
+                        let mut total = 0u64;
+                        let mut reader: Box<dyn AsyncRead + Unpin + Send> =
+                            Box::new(tokio::io::empty());
+                        for path in paths {
+                            let name = safe_file_name(
+                                path.file_name()
+                                    .and_then(|n| n.to_str())
+                                    .ok_or("Invalid file name.")?,
+                            )?;
+                            let file = tokio::fs::File::open(&path)
+                                .await
+                                .map_err(|_| "Cannot open copied file.")?;
+                            let meta = file
+                                .metadata()
+                                .await
+                                .map_err(|_| "Cannot inspect copied file.")?;
+                            if !meta.is_file() || meta.len() > MAX_FILE - total {
+                                return Err("Copy regular files totaling at most 128 MiB.".into());
+                            }
+                            total += meta.len();
+                            entries.push((name, meta.len()));
+                            sources.push((path, meta.len(), meta.modified().ok()));
+                            reader = Box::new(reader.chain(file.take(meta.len())));
+                        }
+                        // Fail before streaming: the receiver puts all files in one folder.
+                        if !distinct_names(entries.iter().map(|(name, _)| name.as_str())) {
+                            return Err("Copied files must have different names.".into());
+                        }
+                        (
+                            ClipboardFormat::Files(entries),
+                            reader,
+                            total,
+                            ClipboardDigest::Files(sources),
+                        )
                     }
-                    (ClipboardFormat::Files(entries), reader, total)
-                }
-                Content::Image {
-                    width,
-                    height,
-                    rgba,
-                } => {
-                    let bytes = rgba.len() as u64;
-                    (
-                        ClipboardFormat::Image { width, height },
-                        Box::new(std::io::Cursor::new(rgba)),
-                        bytes,
-                    )
-                }
-                Content::Text(_) => unreachable!(),
-            };
+                    Content::Image {
+                        width,
+                        height,
+                        rgba,
+                    } => {
+                        let bytes = rgba.len() as u64;
+                        let (rgba, digest) = image_digest(width, height, rgba).await?;
+                        (
+                            ClipboardFormat::Image { width, height },
+                            Box::new(std::io::Cursor::new(rgba)),
+                            bytes,
+                            digest,
+                        )
+                    }
+                    Content::Text(_) => unreachable!(),
+                };
             format.validate(bytes)?;
-            return send_stream(
-                core,
+            if only_if_changed && core.clipboard_sync.is_synced(id, &digest) {
+                return Ok(false);
+            }
+            send_stream(
+                core.clone(),
                 id,
                 session,
                 reader,
@@ -1773,12 +2159,17 @@ pub async fn send_clipboard(core: Arc<Core>, id: &str) -> Result<(), String> {
                 bytes,
                 Some(format),
             )
-            .await
-            .map(|_| ());
+            .await?;
+            core.clipboard_sync.record(id, vec![digest], false);
+            return Ok(true);
         }
     };
     if text.len() > MAX_CLIPBOARD {
         return Err("Clipboard text exceeds 24 KiB.".into());
+    }
+    let digest = ClipboardDigest::Text(hash_bytes(text.as_bytes()));
+    if only_if_changed && core.clipboard_sync.is_synced(id, &digest) {
+        return Ok(false);
     }
     let wire = Wire::Clipboard {
         request: Uuid::new_v4().to_string(),
@@ -1793,7 +2184,9 @@ pub async fn send_clipboard(core: Arc<Core>, id: &str) -> Result<(), String> {
         return Err("Encoded clipboard text exceeds the message limit.".into());
     }
     permit(&core, id, false)?;
-    request(&session, wire).await
+    request(&session, wire).await?;
+    core.clipboard_sync.record(id, vec![digest], false);
+    Ok(true)
 }
 pub async fn set_control(core: Arc<Core>, id: &str, enabled: bool) -> Result<(), String> {
     let session = session(&core, id)?;
@@ -2049,6 +2442,7 @@ async fn finish_clipboard(
                 .await
                 .map_err(|_| "Cannot read received image.")?;
             format.validate(rgba.len() as u64)?;
+            let (rgba, digest) = image_digest(*width, *height, rgba).await?;
             permit_transfer(core, id, Some(format))?;
             core.clipboard
                 .write(Content::Image {
@@ -2056,7 +2450,9 @@ async fn finish_clipboard(
                     height: *height,
                     rgba,
                 })
-                .await
+                .await?;
+            record_received(core, id, Some(digest)).await;
+            Ok(())
         }
         ClipboardFormat::Files(entries) => {
             let directory = tempfile::Builder::new()
@@ -2087,11 +2483,35 @@ async fn finish_clipboard(
                 paths.push(path);
             }
             permit_transfer(core, id, Some(format))?;
-            core.clipboard.write(Content::Files(paths)).await?;
-            let _ = directory.keep();
+            // The clipboard points into this folder, so it must outlive the
+            // handle. Anything that fails from here removes it explicitly.
+            let kept = directory.keep();
+            if let Err(error) = core.clipboard.write(Content::Files(paths.clone())).await {
+                let _ = tokio::fs::remove_dir_all(&kept).await;
+                return Err(error);
+            }
+            // The folder stays like any received file: the user may open,
+            // edit or link to these copies. The ledger keeps Flow from
+            // sending the same copy again, so folders appear only for new copies.
+            record_received(core, id, files_digest(&paths).await).await;
             Ok(())
         }
     }
+}
+
+/// Records what both computers hold after a copy arrived from `id`. The
+/// system clipboard may convert what TrapLink wrote, so the content it reads
+/// back counts as already shared too. That keeps Flow from echoing it.
+async fn record_received(core: &Core, id: &str, received: Option<ClipboardDigest>) {
+    let mut synced: Vec<ClipboardDigest> = received.into_iter().collect();
+    if let Ok(Some(content)) = core.clipboard.read(true, MAX_CLIPBOARD).await {
+        if let Some(digest) = content_digest(content).await {
+            if !synced.contains(&digest) {
+                synced.push(digest);
+            }
+        }
+    }
+    core.clipboard_sync.record(id, synced, true);
 }
 
 pub async fn send_file(core: Arc<Core>, id: &str, path: &Path) -> Result<Transfer, String> {
@@ -2161,6 +2581,11 @@ async fn send_stream(
         let mut total = 0u64;
         loop {
             permit_transfer(&core, id, clipboard.as_ref())?;
+            // The receiver can refuse a transfer it accepted, for example when
+            // its disk is full or the user turned sharing off. Stop sending.
+            if let Some(error) = take_refusal(&session.refused, &transfer.id) {
+                return Err(error);
+            }
             let count = file.read(&mut buffer).await.map_err(|e| e.to_string())?;
             if count == 0 {
                 break;
@@ -2202,6 +2627,11 @@ async fn send_stream(
         .await
     }
     .await;
+    // Report the receiver's own reason rather than a later "Unknown transfer."
+    let result = match (result, take_refusal(&session.refused, &transfer.id)) {
+        (Err(_), Some(refusal)) => Err(refusal),
+        (result, _) => result,
+    };
     transfer.status = if result.is_ok() { "complete" } else { "failed" }.into();
     core.transfer_status(&transfer.id, &transfer.status);
     transfer_guard.complete = result.is_ok();
@@ -2268,7 +2698,9 @@ mod tests {
             .err()
             .unwrap()
             .contains("expired"));
-        assert!(decode_invitation(&code, 1_699_999_999).is_err());
+        // A code that outlives the 5-minute lifetime by more than the clock
+        // tolerance was not made by TrapLink.
+        assert!(decode_invitation(&code, 1_700_000_300 - 421).is_err());
         assert!(
             decode_invitation(&code.replacen("v1:", "v2:", 1), 1_700_000_000)
                 .err()
@@ -2323,6 +2755,16 @@ mod tests {
         let mut missing = valid.clone();
         missing.as_object_mut().unwrap().remove("publicKey");
         assert!(decode_invitation(&raw_invitation(&missing), 1_700_000_000).is_err());
+    }
+
+    #[test]
+    fn invitation_from_a_computer_with_a_fast_clock_still_pairs() {
+        let code = raw_invitation(&serde_json::to_value(encoded_test_invitation()).unwrap());
+        // The inviting computer runs 30 seconds and 2 minutes ahead.
+        assert!(decode_invitation(&code, 1_700_000_300 - 300 - 30).is_ok());
+        assert!(decode_invitation(&code, 1_700_000_300 - 420).is_ok());
+        // Tolerance never extends how long a code stays usable here.
+        assert!(decode_invitation(&code, 1_700_000_300).is_err());
     }
 
     fn receiving_fixture() -> (tempfile::TempDir, Arc<Core>, Peer) {
@@ -3005,7 +3447,7 @@ mod tests {
             .unwrap();
         send_clipboard(first.clone(), &second_id).await.unwrap();
         assert!(
-            matches!(second.clipboard.read().await.unwrap(), Some(Content::Image { width: 300, height: 150, rgba }) if rgba == payload)
+            matches!(second.clipboard.read(true, usize::MAX).await.unwrap(), Some(Content::Image { width: 300, height: 150, rgba }) if rgba == payload)
         );
         let empty = second_dir.path().join("empty.txt");
         std::fs::write(&empty, []).unwrap();
@@ -3018,7 +3460,8 @@ mod tests {
         assert!(send_clipboard(second.clone(), &connected.id).await.is_err());
         first.data.lock().unwrap().peers[0].peer.permissions.files = true;
         send_clipboard(second.clone(), &connected.id).await.unwrap();
-        let Some(Content::Files(paths)) = first.clipboard.read().await.unwrap() else {
+        let Some(Content::Files(paths)) = first.clipboard.read(true, usize::MAX).await.unwrap()
+        else {
             panic!("expected copied files");
         };
         assert_eq!(paths.len(), 2);
@@ -3058,6 +3501,658 @@ mod tests {
         .await;
         assert!(result.is_err());
         assert!(!core.invite.lock().unwrap().as_ref().unwrap().reserved);
+    }
+
+    /// The far end of a real session: run_session drives `core`, and the test
+    /// speaks the encrypted wire protocol as the peer.
+    struct TestPeer {
+        stream: TcpStream,
+        noise: snow::TransportState,
+    }
+    impl TestPeer {
+        async fn send(&mut self, wire: Wire) {
+            write_wire(&mut self.stream, &mut self.noise, &wire)
+                .await
+                .unwrap();
+        }
+        /// The next message other than a heartbeat, or `None` once the
+        /// session closed.
+        async fn next(&mut self) -> Option<Wire> {
+            loop {
+                let frame =
+                    tokio::time::timeout(Duration::from_secs(5), read_frame(&mut self.stream))
+                        .await
+                        .expect("the session stopped answering");
+                let Ok(frame) = frame else {
+                    return None;
+                };
+                match decrypt(&mut self.noise, &frame).unwrap() {
+                    Wire::Probe { .. } | Wire::Ping => {}
+                    wire => return Some(wire),
+                }
+            }
+        }
+        /// Proves the session handled everything sent before.
+        async fn sync(&mut self) {
+            self.send(Wire::Probe { id: 77 }).await;
+            assert!(matches!(
+                self.next().await,
+                Some(Wire::ProbeReply { id: 77 })
+            ));
+        }
+        /// Streams one transfer and returns the receiver's error, if any.
+        async fn push(
+            &mut self,
+            clipboard: Option<ClipboardFormat>,
+            name: &str,
+            payload: &[u8],
+        ) -> Option<String> {
+            let request = Uuid::new_v4().to_string();
+            self.send(Wire::FileStart {
+                request: request.clone(),
+                clipboard,
+                name: name.into(),
+                bytes: payload.len() as u64,
+            })
+            .await;
+            match self.next().await {
+                Some(Wire::Ack { error: None, .. }) => {}
+                Some(Wire::Ack { error, .. }) => return error,
+                _ => panic!("expected the transfer to be acknowledged"),
+            }
+            self.send(Wire::FileChunk {
+                request: request.clone(),
+                data: STANDARD.encode(payload),
+            })
+            .await;
+            self.send(Wire::FileEnd { request }).await;
+            match self.next().await {
+                Some(Wire::Ack { error, .. }) => error,
+                _ => panic!("expected the transfer result"),
+            }
+        }
+    }
+
+    fn noise_transport_pair() -> (snow::TransportState, snow::TransportState) {
+        let builder = || snow::Builder::new(NOISE_PAIR.parse().unwrap());
+        let (a, b) = (
+            builder().generate_keypair().unwrap(),
+            builder().generate_keypair().unwrap(),
+        );
+        let key = [7u8; 32];
+        let mut initiator = builder()
+            .local_private_key(&a.private)
+            .unwrap()
+            .psk(3, &key)
+            .unwrap()
+            .build_initiator()
+            .unwrap();
+        let mut responder = builder()
+            .local_private_key(&b.private)
+            .unwrap()
+            .psk(3, &key)
+            .unwrap()
+            .build_responder()
+            .unwrap();
+        let (mut out, mut plain) = ([0u8; 1024], [0u8; 1024]);
+        let n = initiator.write_message(&[], &mut out).unwrap();
+        responder.read_message(&out[..n], &mut plain).unwrap();
+        let n = responder.write_message(&[], &mut out).unwrap();
+        initiator.read_message(&out[..n], &mut plain).unwrap();
+        let n = initiator.write_message(&[], &mut out).unwrap();
+        responder.read_message(&out[..n], &mut plain).unwrap();
+        (
+            initiator.into_transport_mode().unwrap(),
+            responder.into_transport_mode().unwrap(),
+        )
+    }
+
+    async fn connected_session(core: &Arc<Core>, peer: &Peer, protocol: u32) -> TestPeer {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (client, server) = tokio::join!(TcpStream::connect(address), listener.accept());
+        let (local, remote) = noise_transport_pair();
+        install_session(
+            core.clone(),
+            server.unwrap().0,
+            local,
+            peer.clone(),
+            protocol,
+        )
+        .unwrap();
+        TestPeer {
+            stream: client.unwrap(),
+            noise: remote,
+        }
+    }
+
+    fn allow_clipboard(core: &Core) {
+        let mut data = core.data.lock().unwrap();
+        data.settings.clipboard_enabled = true;
+        for trusted in &mut data.peers {
+            trusted.peer.permissions.clipboard = true;
+        }
+    }
+
+    fn clipboard_folders(core: &Core) -> Vec<PathBuf> {
+        std::fs::read_dir(receive_folder(core).unwrap())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("Clipboard-"))
+            })
+            .collect()
+    }
+
+    fn transfer_status(core: &Core, id: &str) -> Option<String> {
+        core.transfers
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|transfer| transfer.id == id)
+            .map(|transfer| transfer.status.clone())
+    }
+
+    #[tokio::test]
+    async fn received_clipboard_is_not_echoed_back_and_copies_are_kept() {
+        let (_directory, core, peer) = receiving_fixture();
+        allow_clipboard(&core);
+        let mut remote = connected_session(&core, &peer, crate::link::PROTOCOL).await;
+        let files = || ClipboardFormat::Files(vec![("a.txt".into(), 3)]);
+        assert_eq!(remote.push(Some(files()), "Clipboard", b"one").await, None);
+        assert_eq!(clipboard_folders(&core).len(), 1);
+        // Flow switches back. The peer already holds these files.
+        assert!(matches!(
+            send_clipboard_content(core.clone(), &peer.id, true).await,
+            Ok(false)
+        ));
+        remote.sync().await;
+
+        let image = ClipboardFormat::Image {
+            width: 1,
+            height: 1,
+        };
+        assert_eq!(remote.push(Some(image), "Clipboard", &[9; 4]).await, None);
+        assert!(matches!(
+            send_clipboard_content(core.clone(), &peer.id, true).await,
+            Ok(false)
+        ));
+
+        let first = clipboard_folders(&core).remove(0).join("a.txt");
+        assert_eq!(remote.push(Some(files()), "Clipboard", b"two").await, None);
+        // The user may still use the earlier copy, so it stays.
+        assert_eq!(clipboard_folders(&core).len(), 2);
+        assert_eq!(std::fs::read(&first).unwrap(), b"one");
+        let Some(crate::clipboard::Content::Files(paths)) =
+            core.clipboard.read(true, usize::MAX).await.unwrap()
+        else {
+            panic!("the received files should be on the clipboard");
+        };
+        assert_ne!(paths[0], first);
+        assert_eq!(std::fs::read(&paths[0]).unwrap(), b"two");
+        assert!(matches!(
+            send_clipboard_content(core.clone(), &peer.id, true).await,
+            Ok(false)
+        ));
+
+        remote
+            .send(Wire::Clipboard {
+                request: "text".into(),
+                text: "hello".into(),
+            })
+            .await;
+        assert!(matches!(
+            remote.next().await,
+            Some(Wire::Ack { error: None, .. })
+        ));
+        assert!(matches!(
+            send_clipboard_content(core.clone(), &peer.id, true).await,
+            Ok(false)
+        ));
+        remote.sync().await;
+    }
+
+    #[tokio::test]
+    async fn sent_text_is_shared_on_every_switch() {
+        let (_directory, core, peer) = receiving_fixture();
+        allow_clipboard(&core);
+        let mut remote = connected_session(&core, &peer, crate::link::PROTOCOL).await;
+        // The peer may copy something else without this computer seeing it,
+        // so a switch sends the same text again.
+        for (text, only_if_changed) in [("first", false), ("first", true), ("second", true)] {
+            core.clipboard
+                .write(crate::clipboard::Content::Text(text.into()))
+                .await
+                .unwrap();
+            let (sender, id) = (core.clone(), peer.id.clone());
+            let send =
+                tokio::spawn(
+                    async move { send_clipboard_content(sender, &id, only_if_changed).await },
+                );
+            let Some(Wire::Clipboard {
+                request,
+                text: sent,
+            }) = remote.next().await
+            else {
+                panic!("expected the clipboard text");
+            };
+            assert_eq!(sent, text);
+            remote
+                .send(Wire::Ack {
+                    request,
+                    error: None,
+                })
+                .await;
+            assert!(matches!(send.await.unwrap(), Ok(true)));
+        }
+        remote.sync().await;
+    }
+
+    #[tokio::test]
+    async fn switching_back_during_an_automatic_share_keeps_this_copy() {
+        let (_directory, core, peer) = receiving_fixture();
+        allow_clipboard(&core);
+        let mut remote = connected_session(&core, &peer, crate::link::PROTOCOL).await;
+        core.clipboard
+            .write(crate::clipboard::Content::Text("newer".into()))
+            .await
+            .unwrap();
+        let link = session(&core, &peer.id).unwrap();
+        // This computer's automatic share is still reading its clipboard when
+        // the pointer bounces back and the peer shares its older copy.
+        let share = AutomaticShare::begin(&link.clipboard).unwrap();
+        remote
+            .send(Wire::Clipboard {
+                request: "older".into(),
+                text: "older".into(),
+            })
+            .await;
+        let Some(Wire::Ack { error, .. }) = remote.next().await else {
+            panic!("expected an answer");
+        };
+        assert_eq!(error.as_deref(), Some(SHARING_OWN_CLIPBOARD));
+        remote
+            .send(Wire::FileStart {
+                request: Uuid::new_v4().to_string(),
+                clipboard: Some(ClipboardFormat::Image {
+                    width: 1,
+                    height: 1,
+                }),
+                name: "Clipboard".into(),
+                bytes: 4,
+            })
+            .await;
+        let Some(Wire::Ack { error, .. }) = remote.next().await else {
+            panic!("expected an answer");
+        };
+        assert_eq!(error.as_deref(), Some(SHARING_OWN_CLIPBOARD));
+        assert!(matches!(
+            core.clipboard.read(true, MAX_CLIPBOARD).await,
+            Ok(Some(crate::clipboard::Content::Text(text))) if text == "newer"
+        ));
+
+        drop(share);
+        remote
+            .send(Wire::Clipboard {
+                request: "later".into(),
+                text: "later".into(),
+            })
+            .await;
+        assert!(matches!(
+            remote.next().await,
+            Some(Wire::Ack { error: None, .. })
+        ));
+        remote.sync().await;
+    }
+
+    #[tokio::test]
+    async fn flow_never_overwrites_a_newer_copy_that_is_still_arriving() {
+        let (_directory, core, peer) = receiving_fixture();
+        allow_clipboard(&core);
+        let mut remote = connected_session(&core, &peer, crate::link::PROTOCOL).await;
+        let request = Uuid::new_v4().to_string();
+        remote
+            .send(Wire::FileStart {
+                request: request.clone(),
+                clipboard: Some(ClipboardFormat::Files(vec![("big.bin".into(), 10)])),
+                name: "Clipboard".into(),
+                bytes: 10,
+            })
+            .await;
+        assert!(matches!(
+            remote.next().await,
+            Some(Wire::Ack { error: None, .. })
+        ));
+        remote.sync().await;
+        assert!(!share_clipboard_on_switch(core.clone(), peer.id.clone()));
+        remote.send(Wire::FileAbort { request }).await;
+        remote.sync().await;
+        let link = session(&core, &peer.id).unwrap();
+        let share = AutomaticShare::begin(&link.clipboard).expect("nothing is arriving now");
+        // One automatic share at a time, so two quick switches cannot race.
+        assert!(AutomaticShare::begin(&link.clipboard).is_none());
+        assert!(!share_clipboard_on_switch(core.clone(), peer.id.clone()));
+        drop(share);
+        assert!(share_clipboard_on_switch(core.clone(), peer.id.clone()));
+    }
+
+    #[tokio::test]
+    async fn older_peers_get_the_text_of_a_copy_that_also_has_a_picture() {
+        let (_directory, core, peer) = receiving_fixture();
+        allow_clipboard(&core);
+        let mut remote = connected_session(&core, &peer, crate::link::SCOPED_FLOW).await;
+        core.clipboard.offer(vec![
+            crate::clipboard::Content::Image {
+                width: 1,
+                height: 1,
+                rgba: vec![0; 4],
+            },
+            crate::clipboard::Content::Text("A1".into()),
+        ]);
+        let (sender, id) = (core.clone(), peer.id.clone());
+        let send = tokio::spawn(async move { send_clipboard(sender, &id).await });
+        let Some(Wire::Clipboard { request, text }) = remote.next().await else {
+            panic!("expected the copied text");
+        };
+        assert_eq!(text, "A1");
+        remote
+            .send(Wire::Ack {
+                request,
+                error: None,
+            })
+            .await;
+        assert_eq!(send.await.unwrap(), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn sender_stops_and_reports_a_refusal_from_the_receiver() {
+        let (directory, core, peer) = receiving_fixture();
+        let mut remote = connected_session(&core, &peer, crate::link::PROTOCOL).await;
+        let path = directory.path().join("large.bin");
+        let chunks = 256;
+        std::fs::write(&path, vec![1u8; CHUNK * chunks]).unwrap();
+        let (sender, id) = (core.clone(), peer.id.clone());
+        let send = tokio::spawn(async move { send_file(sender, &id, &path).await });
+        let Some(Wire::FileStart { request, .. }) = remote.next().await else {
+            panic!("expected the transfer to start");
+        };
+        remote
+            .send(Wire::Ack {
+                request: request.clone(),
+                error: None,
+            })
+            .await;
+        assert!(matches!(remote.next().await, Some(Wire::FileChunk { .. })));
+        remote
+            .send(Wire::Ack {
+                request: request.clone(),
+                error: Some("The receiving disk is full.".into()),
+            })
+            .await;
+        let mut received = 1;
+        let aborted = loop {
+            match remote.next().await {
+                Some(Wire::FileChunk { .. }) => received += 1,
+                Some(Wire::FileAbort { .. }) => break true,
+                Some(Wire::FileEnd { request }) => {
+                    let error = Some("Unknown transfer.".into());
+                    remote.send(Wire::Ack { request, error }).await;
+                    break false;
+                }
+                _ => panic!("unexpected message"),
+            }
+        };
+        let result = send.await.unwrap();
+        assert_eq!(result.err().as_deref(), Some("The receiving disk is full."));
+        assert!(aborted, "the sender kept streaming all {received} chunks");
+        assert!(received < chunks);
+    }
+
+    #[tokio::test]
+    async fn a_refused_transfer_is_answered_once() {
+        let (_directory, core, peer) = receiving_fixture();
+        let mut remote = connected_session(&core, &peer, crate::link::PROTOCOL).await;
+        let request = Uuid::new_v4().to_string();
+        remote
+            .send(Wire::FileStart {
+                request: request.clone(),
+                clipboard: None,
+                name: "small.bin".into(),
+                bytes: 4,
+            })
+            .await;
+        assert!(matches!(
+            remote.next().await,
+            Some(Wire::Ack { error: None, .. })
+        ));
+        for _ in 0..3 {
+            remote
+                .send(Wire::FileChunk {
+                    request: request.clone(),
+                    data: STANDARD.encode([0u8; 8]),
+                })
+                .await;
+        }
+        assert!(matches!(
+            remote.next().await,
+            Some(Wire::Ack { error: Some(_), .. })
+        ));
+        // The later chunks of the refused transfer get no reply of their own.
+        remote.sync().await;
+    }
+
+    #[tokio::test]
+    async fn finishing_a_received_file_keeps_the_session_responsive() {
+        let (_directory, core, peer) = receiving_fixture();
+        let mut remote = connected_session(&core, &peer, crate::link::PROTOCOL).await;
+        let folder = receive_folder(&core).unwrap();
+        let gate = test_hold::hold(&folder);
+        let request = Uuid::new_v4().to_string();
+        remote
+            .send(Wire::FileStart {
+                request: request.clone(),
+                clipboard: None,
+                name: "report.txt".into(),
+                bytes: 3,
+            })
+            .await;
+        assert!(matches!(
+            remote.next().await,
+            Some(Wire::Ack { error: None, .. })
+        ));
+        remote
+            .send(Wire::FileChunk {
+                request: request.clone(),
+                data: STANDARD.encode(b"abc"),
+            })
+            .await;
+        remote
+            .send(Wire::FileEnd {
+                request: request.clone(),
+            })
+            .await;
+        // The file is still being synced to disk, yet probes are answered.
+        remote.sync().await;
+        assert_eq!(
+            transfer_status(&core, &request).as_deref(),
+            Some("receiving")
+        );
+        gate.add_permits(1);
+        assert!(matches!(
+            remote.next().await,
+            Some(Wire::Ack { error: None, .. })
+        ));
+        assert_eq!(
+            transfer_status(&core, &request).as_deref(),
+            Some("complete")
+        );
+        let saved: Vec<_> = std::fs::read_dir(&folder)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .collect();
+        assert_eq!(saved.len(), 1, "only the finished file remains");
+        assert!(saved[0].to_string_lossy().ends_with("-report.txt"));
+        assert_eq!(std::fs::read(&saved[0]).unwrap(), b"abc");
+    }
+
+    #[tokio::test]
+    async fn a_clipboard_copy_finishing_during_disconnect_still_completes() {
+        let (_directory, core, peer) = receiving_fixture();
+        allow_clipboard(&core);
+        let mut remote = connected_session(&core, &peer, crate::link::PROTOCOL).await;
+        let gate = test_hold::hold(&receive_folder(&core).unwrap());
+        let request = Uuid::new_v4().to_string();
+        remote
+            .send(Wire::FileStart {
+                request: request.clone(),
+                clipboard: Some(ClipboardFormat::Files(vec![("a.txt".into(), 3)])),
+                name: "Clipboard".into(),
+                bytes: 3,
+            })
+            .await;
+        assert!(matches!(
+            remote.next().await,
+            Some(Wire::Ack { error: None, .. })
+        ));
+        remote
+            .send(Wire::FileChunk {
+                request: request.clone(),
+                data: STANDARD.encode(b"abc"),
+            })
+            .await;
+        remote
+            .send(Wire::FileEnd {
+                request: request.clone(),
+            })
+            .await;
+        remote.sync().await;
+        drop(remote);
+        let ended = tokio::time::timeout(Duration::from_secs(5), async {
+            while session(&core, &peer.id).is_ok() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(ended.is_ok(), "the session should end with its socket");
+        gate.add_permits(1);
+        let finished = tokio::time::timeout(Duration::from_secs(5), async {
+            while transfer_status(&core, &request).as_deref() == Some("receiving") {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(finished.is_ok(), "the transfer was left receiving");
+        assert_eq!(
+            transfer_status(&core, &request).as_deref(),
+            Some("complete")
+        );
+        assert!(matches!(
+            core.clipboard.read(true, usize::MAX).await.unwrap(),
+            Some(crate::clipboard::Content::Files(_))
+        ));
+    }
+
+    #[test]
+    fn finalizing_without_hard_links_moves_the_file_and_never_overwrites() {
+        let directory = tempfile::tempdir().unwrap();
+        let (temporary, destination) = (
+            directory.path().join(".part"),
+            directory.path().join("file.txt"),
+        );
+        let unsupported = |_: &Path, _: &Path| -> std::io::Result<()> {
+            Err(std::io::ErrorKind::Unsupported.into())
+        };
+        std::fs::write(&temporary, b"payload").unwrap();
+        finalize_with(unsupported, &temporary, &destination).unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), b"payload");
+        assert!(!temporary.exists());
+
+        std::fs::write(&temporary, b"newer").unwrap();
+        assert!(finalize_with(unsupported, &temporary, &destination).is_err());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"payload");
+        let linked = directory.path().join("linked.txt");
+        finalize_with(|from, to| std::fs::hard_link(from, to), &temporary, &linked).unwrap();
+        assert_eq!(std::fs::read(&linked).unwrap(), b"newer");
+        assert!(!temporary.exists());
+    }
+
+    #[test]
+    fn startup_sweep_removes_only_old_traplink_leftovers() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let part = root.join(format!(".{}.part", Uuid::new_v4()));
+        let keep = [
+            root.join("notes.part"),
+            root.join(format!(".{}.part.txt", Uuid::new_v4())),
+            root.join("Clipboard-abc123.txt"),
+            root.join("photo.jpg"),
+        ];
+        for file in std::iter::once(&part).chain(&keep) {
+            std::fs::write(file, b"x").unwrap();
+        }
+        // Received copies may be kept, opened or linked to by the user.
+        let folders = [
+            root.join("Clipboard-abc123"),
+            root.join("Clipboard-backup"),
+            root.join("Clipboard-projects"),
+        ];
+        for folder in &folders {
+            std::fs::create_dir(folder).unwrap();
+            std::fs::write(folder.join("file.txt"), b"x").unwrap();
+        }
+        let day = Duration::from_secs(24 * 60 * 60);
+        // Leftovers of the current run are fresh and stay.
+        sweep_receive_folder(root, day, SystemTime::now());
+        assert!(part.exists());
+        sweep_receive_folder(root, day, SystemTime::now() + day + day);
+        assert!(!part.exists());
+        assert!(folders
+            .iter()
+            .all(|folder| folder.join("file.txt").exists()));
+        assert!(keep.iter().all(|file| file.exists()));
+    }
+
+    #[tokio::test]
+    async fn copied_files_with_the_same_name_are_refused_before_streaming() {
+        let both = |second: &str| {
+            ClipboardFormat::Files(vec![("a.txt".into(), 1), (second.into(), 1)]).validate(2)
+        };
+        assert!(both("A.TXT").is_err());
+        assert!(both("b.txt").is_ok());
+
+        let (directory, core, peer) = receiving_fixture();
+        allow_clipboard(&core);
+        let mut remote = connected_session(&core, &peer, crate::link::PROTOCOL).await;
+        let format = ClipboardFormat::Files(vec![("a.txt".into(), 1), ("A.txt".into(), 1)]);
+        assert!(remote
+            .push(Some(format), "Clipboard", b"xy")
+            .await
+            .is_some());
+        let folder = receive_folder(&core).unwrap();
+        let partial = std::fs::read_dir(&folder)
+            .map(|entries| entries.flatten().count())
+            .unwrap_or(0);
+        assert_eq!(partial, 0, "nothing was staged");
+
+        let (first, second) = (directory.path().join("one"), directory.path().join("two"));
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        std::fs::write(first.join("a.txt"), b"x").unwrap();
+        std::fs::write(second.join("A.txt"), b"y").unwrap();
+        core.clipboard
+            .offer(vec![crate::clipboard::Content::Files(vec![
+                first.join("a.txt"),
+                second.join("A.txt"),
+            ])]);
+        assert_eq!(
+            send_clipboard(core.clone(), &peer.id).await,
+            Err("Copied files must have different names.".into())
+        );
+        remote.sync().await;
     }
 }
 
