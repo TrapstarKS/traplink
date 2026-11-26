@@ -1124,6 +1124,8 @@ mod tests {
         assert_eq!(saved.settings.device_name, "Renamed");
     }
 
+    // Remapping can be turned on only on Windows; elsewhere `validate` rejects it.
+    #[cfg(target_os = "windows")]
     #[test]
     fn settings_without_a_base_replace_the_current_copy() {
         let directory = tempfile::tempdir().unwrap();
