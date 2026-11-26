@@ -226,8 +226,10 @@ async fn update_settings(
             .lock()
             .map_err(|_| "Settings lock unavailable.")?;
         // A stored name that predates the shared rule stays usable until the user edits it.
-        settings.device_name =
-            model::accept_device_name(&settings.device_name, &data.settings.device_name)?;
+        // An unchanged name from the base snapshot is fine too: the merge keeps the stored one.
+        let mut previous = vec![data.settings.device_name.as_str()];
+        previous.extend(base.as_ref().map(|base| base.device_name.as_str()));
+        settings.device_name = model::accept_device_name(&settings.device_name, &previous)?;
         resolve_settings(&data.settings, &settings, base.as_ref())
     };
     merged.validate()?;

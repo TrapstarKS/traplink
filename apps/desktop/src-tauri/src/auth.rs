@@ -274,7 +274,7 @@ pub async fn poll(core: Arc<Core>) -> Result<LoginPoll, String> {
                 .lock()
                 .map_err(|_| "Account lock unavailable.")? = Some(credential.clone());
             *pending = None;
-            core.clear_warning(SIGNED_OUT_MESSAGE);
+            core.clear_signed_out();
             true
         } else {
             false
@@ -338,7 +338,7 @@ pub async fn logout(core: Arc<Core>) -> Result<(), String> {
         .pending_login
         .lock()
         .map_err(|_| "Account lock unavailable.")? = None;
-    core.clear_warning(SIGNED_OUT_MESSAGE);
+    core.clear_signed_out();
     Ok(())
 }
 
@@ -364,7 +364,7 @@ pub(crate) fn forget_rejected_credential(core: &Core, token: &str) {
     }
     *account = None;
     drop(account);
-    core.warning(SIGNED_OUT_MESSAGE.into());
+    core.mark_signed_out();
 }
 
 /// Reads at most `MAX_ERROR_BODY` bytes of an error response and returns its `message`

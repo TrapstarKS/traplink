@@ -110,8 +110,10 @@ pub fn sanitize_device_name(name: &str) -> Option<String> {
 
 /// The name to store when the user saves Preferences. A changed name must follow the shared
 /// rule; an unchanged one is kept, so settings from older versions can still be saved.
-pub fn accept_device_name(name: &str, previous: &str) -> Result<String, String> {
-    if name == previous {
+/// `previous` holds the stored name and, for a save made against an older snapshot, the name
+/// that snapshot showed (the merge keeps the stored name when the draft did not change it).
+pub fn accept_device_name(name: &str, previous: &[&str]) -> Result<String, String> {
+    if previous.contains(&name) {
         return Ok(name.to_owned());
     }
     validate_device_name(name).map(str::to_owned)
@@ -401,15 +403,21 @@ mod tests {
 
     #[test]
     fn preferences_reject_new_names_the_server_would_reject() {
-        assert!(accept_device_name("PC\tHome", "My computer").is_err());
-        assert!(accept_device_name("Home\u{9f}", "My computer").is_err());
+        assert!(accept_device_name("PC\tHome", &["My computer"]).is_err());
+        assert!(accept_device_name("Home\u{9f}", &["My computer"]).is_err());
         assert_eq!(
-            accept_device_name("  Home PC  ", "My computer").as_deref(),
+            accept_device_name("  Home PC  ", &["My computer"]).as_deref(),
             Ok("Home PC")
         );
         // A name stored by an older version can still be kept while other settings change.
         assert_eq!(
-            accept_device_name("PC\tHome", "PC\tHome").as_deref(),
+            accept_device_name("PC\tHome", &["PC\tHome"]).as_deref(),
+            Ok("PC\tHome")
+        );
+        // A draft from before a background rename still shows the old legacy name. Saving an
+        // unrelated setting must not fail over a name the user never edited.
+        assert_eq!(
+            accept_device_name("PC\tHome", &["Restored PC", "PC\tHome"]).as_deref(),
             Ok("PC\tHome")
         );
     }

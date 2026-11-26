@@ -27,6 +27,9 @@ pub struct Core {
     pub startup_warnings: Vec<String>,
     /// Runtime warnings; transient ones are cleared when resolved or dismissed.
     pub warnings: Mutex<Vec<String>>,
+    /// The server revoked the sign-in. Kept apart from `warnings` so dismissing the banner
+    /// does not hide the Account page's "Sign in again" notice.
+    pub signed_out: AtomicBool,
     pub listening: AtomicBool,
     pub network_changed: Notify,
     pub pending_login: Mutex<Option<PendingLogin>>,
@@ -65,6 +68,7 @@ impl Core {
             transfers: Mutex::new(vec![]),
             startup_warnings: vec![],
             warnings: Mutex::new(vec![]),
+            signed_out: AtomicBool::new(false),
             listening: AtomicBool::new(false),
             network_changed: Notify::new(),
             pending_login: Mutex::new(None),
@@ -109,6 +113,7 @@ impl Core {
             transfers: Mutex::new(vec![]),
             startup_warnings: warnings,
             warnings: Mutex::new(vec![]),
+            signed_out: AtomicBool::new(false),
             listening: AtomicBool::new(false),
             network_changed: Notify::new(),
             pending_login: Mutex::new(None),
@@ -141,6 +146,16 @@ impl Core {
     /// because they last until TrapLink restarts.
     pub fn dismiss_warnings(&self) {
         self.clear_warnings(|_| true);
+    }
+    /// Records that the server revoked the sign-in and shows the matching warning.
+    pub fn mark_signed_out(&self) {
+        self.signed_out.store(true, Ordering::Relaxed);
+        self.warning(crate::auth::SIGNED_OUT_MESSAGE.into());
+    }
+    /// Clears the revoked sign-in state after a new sign-in or a sign-out.
+    pub fn clear_signed_out(&self) {
+        self.signed_out.store(false, Ordering::Relaxed);
+        self.clear_warning(crate::auth::SIGNED_OUT_MESSAGE);
     }
     pub fn clear_warning(&self, message: &str) {
         if let Ok(mut warnings) = self.warnings.lock() {
@@ -242,10 +257,7 @@ impl Core {
             .map_err(|_| "Account lock is unavailable.")?
             .as_ref()
             .map(|c| c.account.clone());
-        let account_expired = account.is_none()
-            && warnings
-                .iter()
-                .any(|warning| warning == crate::auth::SIGNED_OUT_MESSAGE);
+        let account_expired = account.is_none() && self.signed_out.load(Ordering::Relaxed);
         Ok(Snapshot {
             device_id: data.device_id,
             device_name: data.settings.device_name.clone(),
@@ -308,6 +320,23 @@ mod tests {
         );
         core.dismiss_warnings();
         assert!(core.warnings.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn dismissing_warnings_keeps_the_revoked_sign_in_notice() {
+        let directory = tempfile::tempdir().unwrap();
+        let core = Core::for_test(directory.path().to_path_buf(), 48372);
+        core.mark_signed_out();
+        assert!(core.snapshot().unwrap().account_expired);
+        core.dismiss_warnings();
+        let snapshot = core.snapshot().unwrap();
+        assert!(snapshot.account_expired);
+        assert!(!snapshot
+            .warnings
+            .iter()
+            .any(|w| w == crate::auth::SIGNED_OUT_MESSAGE));
+        core.clear_signed_out();
+        assert!(!core.snapshot().unwrap().account_expired);
     }
 
     #[tokio::test]
