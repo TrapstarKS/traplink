@@ -4,6 +4,7 @@ import { appendFileSync, copyFileSync, existsSync, mkdtempSync, readdirSync, rea
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createFlags, isPrerelease, publishFlags } from "./release-channel.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const tauriDir = join(root, "apps", "desktop", "src-tauri");
@@ -79,7 +80,7 @@ function prepare() {
   const existing = releaseInfo(releaseTag);
   if (existing && !existing.isDraft) fail(`release ${releaseTag} is already published. Create a new version instead of replacing published files.`);
   if (!existing) {
-    gh(["release", "create", releaseTag, "--repo", repository(), "--draft", "--verify-tag", "--generate-notes", "--title", `TrapLink ${version}`]);
+    gh(["release", "create", releaseTag, "--repo", repository(), "--draft", ...createFlags(releaseTag), "--verify-tag", "--generate-notes", "--title", `TrapLink ${version}`]);
     console.log(`Created draft release ${releaseTag}.`);
   } else {
     console.log(`Reusing draft release ${releaseTag}.`);
@@ -153,9 +154,10 @@ function finalize() {
   writeFileSync(latestPath, `${JSON.stringify(latest, null, 2)}\n`);
   gh(["release", "upload", releaseTag, "--repo", repo, "--clobber", latestPath], { capture: false });
   for (const { key } of Object.values(PLATFORMS)) gh(["release", "delete-asset", releaseTag, `updater-${key}.json`, "--repo", repo, "--yes"], { allowFailure: true });
-  gh(["release", "edit", releaseTag, "--repo", repo, "--draft=false", "--latest"], { capture: false });
+  // Prereleases keep latest.json as an asset but never become Latest, so stable installs ignore them.
+  gh(["release", "edit", releaseTag, "--repo", repo, "--draft=false", ...publishFlags(releaseTag)], { capture: false });
   rmSync(work, { recursive: true, force: true });
-  console.log(`Published ${releaseTag} with latest.json for ${Object.keys(platforms).join(", ")}.`);
+  console.log(`Published ${releaseTag}${isPrerelease(releaseTag) ? " as a prerelease" : ""} with latest.json for ${Object.keys(platforms).join(", ")}.`);
 }
 
 function prune(args) {
