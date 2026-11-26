@@ -5,6 +5,7 @@ import Link from "next/link";
 import { REGEXP_ONLY_DIGITS_AND_CHARS } from "input-otp";
 import { CircleCheck, CircleX, Laptop, TriangleAlert } from "lucide-react";
 import { authClient } from "@/lib/auth-client";
+import { deviceError } from "@/lib/device-errors";
 import { AuthHeader } from "@/components/auth-header";
 import { SessionLoading, SessionUnavailable } from "@/components/connected";
 import { Badge } from "@/components/ui/badge";
@@ -19,16 +20,6 @@ import { Spinner } from "@/components/ui/spinner";
 const CODE_LENGTH = 8;
 
 function normalizeCode(value: string) { return value.replace(/[^a-z0-9]/gi, "").toUpperCase(); }
-
-function deviceError(error: { error?: unknown; code?: unknown; status?: unknown } | null, fallback: string) {
-  const code = error?.error ?? error?.code;
-  if (error?.status === 429) return "Too many attempts. Wait before checking another code.";
-  if (error?.status === 401) return "Your session expired. Sign in again to authorize the app.";
-  if (code === "access_denied" || error?.status === 403) return "Continue in the browser and account where you started checking this code.";
-  if (code === "expired_token") return "This code has expired. Generate a new one in the app.";
-  if (typeof error?.status === "number" && (error.status === 0 || error.status >= 500)) return "The service is unavailable. Try again shortly.";
-  return fallback;
-}
 
 export function DeviceAuthorization({ initialCode }: { initialCode: string }) {
   const { data: session, isPending, isRefetching, error: sessionError, refetch } = authClient.useSession();
