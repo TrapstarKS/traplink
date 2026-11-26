@@ -241,11 +241,10 @@ fn delete_profile(id: String, state: AppState<'_>) -> Result<(), String> {
 }
 fn reload_remap(core: &Core) {
     match remap::apply(core) {
-        Ok(()) => core.clear_warnings(|w| w.starts_with(REMAP_WARNING)),
-        Err(error) => core.warning(format!("{REMAP_WARNING} {error}")),
+        Ok(()) => remap::clear_resolved_warnings(core),
+        Err(error) => core.warning(format!("{} {error}", remap::UPDATE_WARNING)),
     }
 }
-const REMAP_WARNING: &str = "Remapping could not be updated:";
 #[tauri::command]
 fn dismiss_warnings(state: AppState<'_>) {
     state.dismiss_warnings();
