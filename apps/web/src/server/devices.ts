@@ -4,9 +4,17 @@ import type { AppDatabase } from './database';
 import type { ServerConfig } from './config';
 import { ApiError } from './http';
 
+// Same rule as the desktop app (Rust `model::validate_device_name` and
+// apps/desktop/src/lib/device-name.ts): after trimming, 1 to 80 Unicode code points
+// and no control characters (Unicode category Cc).
+export function isValidDeviceName(name: string): boolean {
+  const length = Array.from(name).length;
+  return length >= 1 && length <= 80 && !/\p{Cc}/u.test(name);
+}
+
 export const registrationSchema = z.object({
   installationId: z.string().uuid(),
-  name: z.string().trim().min(1).max(80).refine(value => !/[\u0000-\u001f\u007f]/.test(value)),
+  name: z.string().trim().refine(isValidDeviceName, 'Use a device name with 1 to 80 characters and no control characters.'),
   platform: z.enum(['windows', 'macos']),
   appVersion: z.string().trim().max(32).default(''),
   publicKey: z.string().regex(/^[A-Za-z0-9+/]+={0,2}$/).min(40).max(128).optional(),
