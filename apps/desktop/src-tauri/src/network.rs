@@ -35,6 +35,9 @@ const INVITATION_PREFIX: &str = "traplink:v1:";
 const MAX_INVITATION_LENGTH: usize = 2048;
 const MAX_INVITATION_CANDIDATES: usize = 8;
 const INVITATION_LIFETIME: Duration = Duration::from_secs(300);
+// The joining computer checks the expiry against its own clock. The inviting
+// computer still enforces the real lifetime with its monotonic clock.
+const INVITATION_CLOCK_SKEW: Duration = Duration::from_secs(120);
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(12);
 const DIRECT_ATTEMPT: Duration = Duration::from_secs(4);
 const PROBE_TIMEOUT: Duration = Duration::from_millis(700);
@@ -76,7 +79,9 @@ fn decode_invitation(invitation: &str, now: i64) -> Result<ParsedInvitation, Str
     if encoded.expires_at <= now {
         return Err("This invitation has expired. Create a new one on the other computer.".into());
     }
-    if encoded.expires_at > now.saturating_add(INVITATION_LIFETIME.as_secs() as i64) {
+    if encoded.expires_at
+        > now.saturating_add((INVITATION_LIFETIME + INVITATION_CLOCK_SKEW).as_secs() as i64)
+    {
         return Err("The invitation expiry is invalid. Check both computer clocks and create a new invitation.".into());
     }
     if encoded.candidates.is_empty() || encoded.candidates.len() > MAX_INVITATION_CANDIDATES {
@@ -2265,7 +2270,9 @@ mod tests {
             .err()
             .unwrap()
             .contains("expired"));
-        assert!(decode_invitation(&code, 1_699_999_999).is_err());
+        // A code that outlives the 5-minute lifetime by more than the clock
+        // tolerance was not made by TrapLink.
+        assert!(decode_invitation(&code, 1_700_000_300 - 421).is_err());
         assert!(
             decode_invitation(&code.replacen("v1:", "v2:", 1), 1_700_000_000)
                 .err()
@@ -2320,6 +2327,16 @@ mod tests {
         let mut missing = valid.clone();
         missing.as_object_mut().unwrap().remove("publicKey");
         assert!(decode_invitation(&raw_invitation(&missing), 1_700_000_000).is_err());
+    }
+
+    #[test]
+    fn invitation_from_a_computer_with_a_fast_clock_still_pairs() {
+        let code = raw_invitation(&serde_json::to_value(encoded_test_invitation()).unwrap());
+        // The inviting computer runs 30 seconds and 2 minutes ahead.
+        assert!(decode_invitation(&code, 1_700_000_300 - 300 - 30).is_ok());
+        assert!(decode_invitation(&code, 1_700_000_300 - 420).is_ok());
+        // Tolerance never extends how long a code stays usable here.
+        assert!(decode_invitation(&code, 1_700_000_300).is_err());
     }
 
     fn receiving_fixture() -> (tempfile::TempDir, Arc<Core>, Peer) {
