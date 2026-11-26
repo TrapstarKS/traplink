@@ -13,6 +13,8 @@ use tauri_plugin_notification::NotificationExt;
 
 pub const AUTOSTART_ARG: &str = "--autostart";
 const HINT_MARKER: &str = "tray-hint-shown";
+/// The tray stop runs the full emergency stop, which also turns remapping off.
+const STOP_LABEL: &str = "Emergency stop (input and remapping)";
 
 static QUITTING: AtomicBool = AtomicBool::new(false);
 
@@ -116,7 +118,7 @@ pub fn install_tray<R: Runtime>(app: &AppHandle<R>, core: Arc<Core>) -> tauri::R
         false,
         None::<&str>,
     )?;
-    let stop = MenuItem::with_id(app, "stop-input", "Stop input sharing", true, None::<&str>)?;
+    let stop = MenuItem::with_id(app, "stop-input", STOP_LABEL, true, None::<&str>)?;
     let exit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
     let menu = Menu::with_items(
         app,
@@ -196,6 +198,12 @@ mod tests {
         assert!(keep_running_on_close(true, false, false));
         assert!(keep_running_on_close(false, true, false));
         assert!(keep_running_on_close(false, false, true));
+    }
+
+    #[test]
+    fn tray_stop_label_names_everything_it_turns_off() {
+        assert!(STOP_LABEL.contains("Emergency stop"));
+        assert!(STOP_LABEL.contains("remapping"));
     }
 
     #[test]

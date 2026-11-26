@@ -108,7 +108,7 @@ Limitations:
 
 ## Remapping (per-application, Windows)
 
-- Off by default (`settings.remapEnabled`, absent in older files means off). It is toggled only from the Profiles page with `set_remap_enabled`. Ctrl+Alt+Esc, the emergency button and restoring a backup turn it off and save it as off. It is never remapped itself.
+- Off by default (`settings.remapEnabled`, absent in older files means off). It is toggled only from the Profiles page with `set_remap_enabled`. Ctrl+Alt+Esc, the emergency button, the tray's Emergency stop item and restoring a backup turn it off and save it as off. It is never remapped itself.
 - Profiles keep the `{from, to}` string mappings, so no migration is needed. `from` is one DOM `KeyboardEvent.code` (aliases like `F1` or `a` are accepted) or `MouseMiddle`/`MouseBack`/`MouseForward`. `to` is a key (`KeyB`), a shortcut (`Ctrl+Shift+KeyC`, where modifiers press first and release in reverse) or `disabled`. Strings that do not parse are kept and ignored, and the status reports them per profile.
 - Profiles with no application apply everywhere. A profile with an application overlays them when the foreground process's executable file name matches it, compared case-insensitively with folders and `.exe` ignored. Roblox's `…\Roblox\Versions\version-*\RobloxPlayerBeta.exe` keeps matching across updates.
 - Profiles limited to one device are saved but not applied, because low-level hooks cannot tell which keyboard sent a key. TrapLink's own window is never remapped, so key capture sees physical keys.
