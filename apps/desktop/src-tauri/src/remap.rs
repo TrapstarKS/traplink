@@ -34,7 +34,10 @@ pub enum Action {
     #[default]
     Pass,
     Disable,
-    Send { mods: u8, key: Option<KeyOut> },
+    Send {
+        mods: u8,
+        key: Option<KeyOut>,
+    },
 }
 
 pub const MOD_CTRL: u8 = 1;
@@ -1386,7 +1389,7 @@ mod tests {
     #[test]
     fn exe_names_match_case_insensitively_and_ignore_folders() {
         let roblox = profile(Some("RobloxPlayerBeta.exe"), &[("KeyQ", "KeyE")]);
-        let compiled = Compiled::new(&[roblox.clone()]);
+        let compiled = Compiled::new(std::slice::from_ref(&roblox));
         for exe in [
             r"C:\Users\x\AppData\Local\Roblox\Versions\version-1a2b3c\RobloxPlayerBeta.exe",
             r"C:\Users\x\AppData\Local\Roblox\Versions\version-9f8e7d\robloxplayerbeta.exe",
@@ -1406,7 +1409,7 @@ mod tests {
             Some(r"C:\Roblox\Versions\version-old\RobloxPlayerBeta.exe"),
             &[],
         );
-        let compiled = Compiled::new(&[by_path.clone()]);
+        let compiled = Compiled::new(std::slice::from_ref(&by_path));
         assert_eq!(
             compiled
                 .resolve(Some(r"D:\Roblox\Versions\version-new\RobloxPlayerBeta.exe"))
@@ -1679,7 +1682,7 @@ mod tests {
         )
         .unwrap();
         profile.validate().unwrap();
-        let compiled = Compiled::new(&[profile.clone()]);
+        let compiled = Compiled::new(std::slice::from_ref(&profile));
         assert_eq!(compiled.profiles[0].ignored, vec![1]);
         assert_eq!(
             compiled.resolve(Some("blender.exe")).table.get(src("F1")),
@@ -1702,6 +1705,9 @@ mod tests {
         // Turning remapping off applies cleanly without installing input hooks.
         set_enabled(&core, false).unwrap();
         let warnings = core.warnings.lock().unwrap().clone();
-        assert_eq!(warnings, vec!["Cannot listen on LAN port 48372.".to_string()]);
+        assert_eq!(
+            warnings,
+            vec!["Cannot listen on LAN port 48372.".to_string()]
+        );
     }
 }

@@ -159,26 +159,11 @@ pub struct PeerPermissions {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum InputEvent {
-    Key {
-        key: String,
-        down: bool,
-    },
-    Move {
-        x: f64,
-        y: f64,
-    },
-    Button {
-        button: u8,
-        down: bool,
-    },
-    Scroll {
-        x: i32,
-        y: i32,
-    },
-    MoveBy {
-        dx: i32,
-        dy: i32,
-    },
+    Key { key: String, down: bool },
+    Move { x: f64, y: f64 },
+    Button { button: u8, down: bool },
+    Scroll { x: i32, y: i32 },
+    MoveBy { dx: i32, dy: i32 },
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

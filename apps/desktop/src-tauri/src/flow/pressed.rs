@@ -267,7 +267,11 @@ mod tests {
         let mut keys = KeyTracker::default();
         assert_eq!(keys.route(ALT, true, false), Route::Local);
         keys.begin();
-        assert_eq!(keys.route(ALT, true, true), Route::Drop, "auto-repeat stays home");
+        assert_eq!(
+            keys.route(ALT, true, true),
+            Route::Drop,
+            "auto-repeat stays home"
+        );
         assert_eq!(keys.route(ALT, true, true), Route::Drop);
         assert_eq!(keys.route(ALT, false, true), Route::Local);
         assert!(!keys.local_down(ALT) && !keys.forwarded_down(ALT));
@@ -301,7 +305,11 @@ mod tests {
         assert!(!keys.awaiting_release(ALT));
         assert_eq!(keys.route(ALT, true, false), Route::Local);
         assert_eq!(keys.route(ALT, false, false), Route::Local);
-        assert_eq!(keys.route(A, true, false), Route::Local, "repeat moves home");
+        assert_eq!(
+            keys.route(A, true, false),
+            Route::Local,
+            "repeat moves home"
+        );
         assert!(keys.local_down(A) && !keys.awaiting_release(A));
         assert_eq!(keys.route(A, false, false), Route::Local);
     }
@@ -363,7 +371,11 @@ mod tests {
         let mut buttons = ButtonTracker::default();
         assert_eq!(buttons.route(0, true, false), Route::Local);
         buttons.begin();
-        assert_eq!(buttons.route(0, false, true), Route::Local, "drag across the edge");
+        assert_eq!(
+            buttons.route(0, false, true),
+            Route::Local,
+            "drag across the edge"
+        );
         assert_eq!(buttons.route(2, true, true), Route::Forward);
         let released: Vec<u8> = buttons.finish().iter().collect();
         assert_eq!(released, vec![2]);
@@ -413,7 +425,7 @@ mod tests {
     #[test]
     fn random_sequences_never_leave_anything_down() {
         let ids = [ALT, A, 0x11D, 0x1033];
-        let mut seed: u64 = 0xF1_0E_5EED;
+        let mut seed: u64 = 0xF10E_5EED;
         let mut next = move |n: u64| {
             seed = seed
                 .wrapping_mul(6364136223846793005)

@@ -145,7 +145,11 @@ fn merge_settings(current: &Settings, base: &Settings, next: &Settings) -> Setti
             &base.file_sharing_enabled,
             &next.file_sharing_enabled,
         ),
-        input_enabled: pick(&current.input_enabled, &base.input_enabled, &next.input_enabled),
+        input_enabled: pick(
+            &current.input_enabled,
+            &base.input_enabled,
+            &next.input_enabled,
+        ),
         start_on_login: pick(
             &current.start_on_login,
             &base.start_on_login,
@@ -555,7 +559,11 @@ fn ensure_emergency_shortcut(app: &tauri::AppHandle, input_enabled: bool) -> Res
     Ok(())
 }
 #[tauri::command]
-async fn request_input_consent(peer_id: String, flow: Option<bool>, state: AppState<'_>) -> Result<(), String> {
+async fn request_input_consent(
+    peer_id: String,
+    flow: Option<bool>,
+    state: AppState<'_>,
+) -> Result<(), String> {
     network::request_input_consent(state.inner().clone(), &peer_id, flow.unwrap_or(false)).await
 }
 #[tauri::command]
@@ -592,7 +600,11 @@ async fn respond_input_consent(
     if allow && result.is_ok() {
         flow::restore_saved(state.inner());
     }
-    if allow { result } else { Ok(()) }
+    if allow {
+        result
+    } else {
+        Ok(())
+    }
 }
 /// Allows input from one peer. While mouse and keyboard was off, the stored grants
 /// of other peers were hidden, so turning it on for this peer revokes them instead
@@ -686,8 +698,12 @@ fn commit_input_grant(core: &Core, peer_id: &str) -> Result<(), String> {
 #[tauri::command]
 fn open_privacy_settings(pane: String, app: tauri::AppHandle) -> Result<(), String> {
     let url = match pane.as_str() {
-        "accessibility" => "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
-        "input_monitoring" => "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent",
+        "accessibility" => {
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+        }
+        "input_monitoring" => {
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent"
+        }
         _ => return Err("Unknown settings pane.".into()),
     };
     if !cfg!(target_os = "macos") {

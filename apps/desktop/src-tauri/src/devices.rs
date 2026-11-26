@@ -370,7 +370,13 @@ mod tests {
         assert_eq!((calls.get(), refreshed[0].name.as_str()), (2, "c"));
         let forced = cached(&cache, later, true, false, enumerate("d")).unwrap();
         assert_eq!((calls.get(), forced[0].name.as_str()), (3, "d"));
-        let busy = cached(&cache, later + INVENTORY_TTL * 3, false, true, enumerate("e"));
+        let busy = cached(
+            &cache,
+            later + INVENTORY_TTL * 3,
+            false,
+            true,
+            enumerate("e"),
+        );
         assert_eq!((calls.get(), busy.unwrap()[0].name.as_str()), (3, "d"));
     }
 

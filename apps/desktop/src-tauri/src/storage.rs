@@ -48,7 +48,14 @@ pub fn sanitize_flow(data: &mut Persisted) {
         data.peers.iter().map(|p| p.peer.id.clone()).collect();
     data.flow_peers.retain(|f| {
         known.contains(&f.peer)
-            && crate::flow::FlowConfig::new(f.edge, f.mode, f.delay_ms, f.block_while_button, f.clipboard).is_ok()
+            && crate::flow::FlowConfig::new(
+                f.edge,
+                f.mode,
+                f.delay_ms,
+                f.block_while_button,
+                f.clipboard,
+            )
+            .is_ok()
             && peers.insert(f.peer.clone())
             && edges.insert(f.edge)
     });
@@ -301,7 +308,10 @@ mod tests {
         let message = startup_failure_message(&error, &directory);
         assert!(message.contains(&error));
         assert!(message.contains("data folder"), "{message}");
-        assert!(message.contains(&directory.display().to_string()), "{message}");
+        assert!(
+            message.contains(&directory.display().to_string()),
+            "{message}"
+        );
         assert!(!message.contains("settings.json"), "{message}");
         assert!(!message.contains("has not been changed"), "{message}");
     }
@@ -329,7 +339,10 @@ mod tests {
     fn older_settings_files_load_with_no_flow_armed() {
         let directory = tempfile::tempdir().unwrap();
         let downloads = serde_json::to_string(&directory.path().display().to_string()).unwrap();
-        let json = format!(r#"{{"schemaVersion":1,"deviceId":"{}","settings":{{"deviceName":"PC","authServerUrl":"https://traplink.traphub.xyz","clipboardEnabled":false,"fileSharingEnabled":false,"inputEnabled":false,"startOnLogin":false,"theme":"dark","downloadDirectory":{downloads},"port":48372}},"profiles":[],"peers":[]}}"#, Uuid::new_v4());
+        let json = format!(
+            r#"{{"schemaVersion":1,"deviceId":"{}","settings":{{"deviceName":"PC","authServerUrl":"https://traplink.traphub.xyz","clipboardEnabled":false,"fileSharingEnabled":false,"inputEnabled":false,"startOnLogin":false,"theme":"dark","downloadDirectory":{downloads},"port":48372}},"profiles":[],"peers":[]}}"#,
+            Uuid::new_v4()
+        );
         fs::write(directory.path().join("settings.json"), json).unwrap();
         let data = load(directory.path(), "ignored".into()).unwrap();
         assert!(data.flow_peers.is_empty());
@@ -378,7 +391,9 @@ mod tests {
     #[test]
     fn older_settings_files_keep_start_on_login_off() {
         let downloads = serde_json::to_string(&std::env::temp_dir().display().to_string()).unwrap();
-        let json = format!(r#"{{"deviceName":"PC","authServerUrl":"https://traplink.traphub.xyz","clipboardEnabled":false,"fileSharingEnabled":false,"inputEnabled":false,"startOnLogin":false,"theme":"dark","downloadDirectory":{downloads},"port":48372}}"#);
+        let json = format!(
+            r#"{{"deviceName":"PC","authServerUrl":"https://traplink.traphub.xyz","clipboardEnabled":false,"fileSharingEnabled":false,"inputEnabled":false,"startOnLogin":false,"theme":"dark","downloadDirectory":{downloads},"port":48372}}"#
+        );
         let settings: Settings = serde_json::from_str(&json).unwrap();
         assert!(!settings.start_on_login);
         assert!(!settings.remap_enabled);

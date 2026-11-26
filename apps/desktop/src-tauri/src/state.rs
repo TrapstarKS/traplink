@@ -203,7 +203,11 @@ impl Core {
             .clone();
         let warnings_dismissible = !runtime.is_empty();
         let mut warnings = self.startup_warnings.clone();
-        warnings.extend(runtime.into_iter().filter(|w| !self.startup_warnings.contains(w)));
+        warnings.extend(
+            runtime
+                .into_iter()
+                .filter(|w| !self.startup_warnings.contains(w)),
+        );
         let devices = match crate::devices::inventory_cached(refresh_devices) {
             Ok(devices) => devices,
             Err(error) => {
