@@ -14,7 +14,7 @@ The app checks for new versions at launch and notifies you. Nothing installs unt
 
 ## Start at login and tray
 
-"Start with the computer" in Preferences (off by default) registers TrapLink to launch at login, hidden in the tray. With it on, or while Flow or remapping is active, closing the window keeps the app in the tray (Open TrapLink, Flow and remapping status, Turn off input, Quit). Launching the app again only shows the existing window. For safety, input sharing and Flow are off again whenever TrapLink exits.
+"Start at login" in Preferences (off by default) registers TrapLink to launch at login, hidden in the tray. With it on, or while Flow or remapping is active, closing the window keeps the app in the tray (Open TrapLink, Flow and remapping status, Stop input sharing, Quit). Launching the app again only shows the existing window. For safety, input sharing and Flow are off again whenever TrapLink exits.
 
 ## Layout
 
