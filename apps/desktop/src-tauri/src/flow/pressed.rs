@@ -17,9 +17,12 @@ pub trait Slots: Copy + Default {
     fn remove(&mut self, other: &Self);
 }
 
-const KEY_WORDS: usize = 16;
+const KEY_WORDS: usize = 24;
 const UNMAPPED_BASE: u32 = 0x1000;
-const MAPPED_SLOTS: u32 = 0x200;
+// Real key ids are below 0x200. Ids 0x200..0x400 are synthetic Windows keys
+// such as AltGr's fake left Ctrl: never sent, but tracked so each release
+// goes where its press went.
+const MAPPED_SLOTS: u32 = 0x400;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct KeySet([u64; KEY_WORDS]);
@@ -240,16 +243,21 @@ mod tests {
     #[test]
     fn key_set_covers_mapped_and_unmapped_ids() {
         let mut set = KeySet::default();
-        for id in [0x00, 0x1D, 0x11D, 0x1FF, 0x1000, 0x1033, 0x11FF] {
+        for id in [
+            0x00, 0x1D, 0x11D, 0x1FF, 0x21D, 0x3FF, 0x1000, 0x1033, 0x11FF,
+        ] {
             assert!(set.put(id), "{id:#x}");
             assert!(set.has(id));
         }
         assert!(!set.put(0x1D));
-        assert!(!set.put(0x200));
-        assert!(!set.has(0x200));
+        assert!(!set.put(0x400));
+        assert!(!set.has(0x400));
         assert!(!set.put(0x5000));
         let ids: Vec<u32> = set.iter().collect();
-        assert_eq!(ids, vec![0x00, 0x1D, 0x11D, 0x1FF, 0x1000, 0x1033, 0x11FF]);
+        assert_eq!(
+            ids,
+            vec![0x00, 0x1D, 0x11D, 0x1FF, 0x21D, 0x3FF, 0x1000, 0x1033, 0x11FF]
+        );
         assert!(set.take(0x11D) && !set.take(0x11D));
         assert!(set.any());
     }

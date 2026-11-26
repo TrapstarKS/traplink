@@ -447,7 +447,8 @@ pub fn key_id(scan: u32, extended: bool) -> u32 {
 }
 /// Scan code of a Windows low-level keyboard event. Codes above 0xFF are
 /// synthetic, such as the fake left Ctrl (0x21D) that Windows sends with
-/// AltGr. They stay at 0x200 and above, so they never become a real key id.
+/// AltGr. They stay at 0x200 and above, so they never become a real key id
+/// and are never sent, but they are still tracked like any other key.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub fn ll_scan(scan_code: u32) -> u32 {
     if scan_code > 0xFF {
@@ -3897,6 +3898,55 @@ mod tests {
             );
         }
         assert!(logic.end_forwarding("peer").is_empty());
+    }
+
+    #[test]
+    fn altgr_held_across_the_edge_is_released_locally() {
+        let altgr = |down| {
+            [
+                key(ll_scan(0x21D), false, down),
+                key(ll_scan(0x38), true, down),
+            ]
+        };
+        let s = &Layout::single(screen());
+        let now = Instant::now();
+        // Pressed locally, released while forwarding: the local system saw
+        // both downs, so both ups must reach it too.
+        let mut logic = armed_logic(FlowEdge::Right);
+        for event in altgr(true) {
+            assert_eq!(
+                logic.handle(event, false, false, s, now),
+                (Verdict::Pass, None)
+            );
+        }
+        logic.start_forwarding((960, 540));
+        for event in altgr(false) {
+            assert_eq!(
+                logic.handle(event, false, true, s, now),
+                (Verdict::Pass, None)
+            );
+        }
+        assert!(logic.end_forwarding("peer").is_empty());
+        // Pressed while forwarding, released after: the local system never
+        // saw the fake Ctrl down, so its up stays away from it.
+        let mut logic = armed_logic(FlowEdge::Right);
+        logic.start_forwarding((960, 540));
+        let [ctrl, alt] = altgr(true);
+        logic.handle(ctrl, false, true, s, now);
+        logic.handle(alt, false, true, s, now);
+        assert_eq!(
+            logic.end_forwarding("peer"),
+            vec![InputEvent::Key {
+                key: "AltRight".into(),
+                down: false
+            }]
+        );
+        for event in altgr(false) {
+            assert_eq!(
+                logic.handle(event, false, false, s, now),
+                (Verdict::Swallow, None)
+            );
+        }
     }
 
     #[test]

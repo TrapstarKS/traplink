@@ -581,6 +581,9 @@ impl Engine {
     pub fn set_enabled(&mut self, enabled: bool) -> Vec<Synth> {
         let released = if enabled { vec![] } else { self.release_all() };
         if enabled && !self.enabled {
+            // A disabled engine gets no events, so orphans from the last
+            // session were released on the system and are gone.
+            self.slots.fill(Slot::Idle);
             self.ctrl = 0;
             self.alt = 0;
         }
@@ -625,12 +628,14 @@ impl Engine {
         self.suspend()
     }
     /// Whether this physical key's press was swallowed and is still tracked,
-    /// so the system key state cannot report it.
+    /// so the system key state cannot report it. A disabled engine swallows
+    /// nothing, so it never claims a key.
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     pub fn holds(&self, source: Source) -> bool {
-        source
-            .slot()
-            .is_some_and(|index| matches!(self.slots[index], Slot::Held(_) | Slot::Orphan))
+        self.enabled
+            && source
+                .slot()
+                .is_some_and(|index| matches!(self.slots[index], Slot::Held(_) | Slot::Orphan))
     }
     /// Before an Esc press is read as Ctrl+Alt+Esc, drops Ctrl and Alt bits
     /// whose key was passed to the system and that it now reports up: their
@@ -797,8 +802,12 @@ fn hook(source: Source, down: bool, forwarding: bool) -> bool {
 
 /// Whether remapping swallowed this physical key's press and still tracks it.
 /// Counts as held when the engine is busy, so callers never drop a real press.
+/// While remapping is off nothing is swallowed and the key state is exact.
 #[cfg(target_os = "windows")]
 pub(crate) fn holds_key(id: u32) -> bool {
+    if !ACTIVE.load(Ordering::Acquire) {
+        return false;
+    }
     let Ok(id) = u16::try_from(id) else {
         return false;
     };
@@ -1596,6 +1605,26 @@ mod tests {
         run(&mut engine, src("ControlLeft"), true);
         run(&mut engine, src("AltLeft"), true);
         assert_eq!(run(&mut engine, src("Escape"), true).0, Verdict::Emergency);
+    }
+
+    #[test]
+    fn a_disabled_engine_never_claims_a_held_key() {
+        let mut engine = engine_with(&[("ControlLeft", "disabled"), ("AltLeft", "KeyB")]);
+        run(&mut engine, src("ControlLeft"), true);
+        run(&mut engine, src("AltLeft"), true);
+        assert!(engine.holds(src("ControlLeft")) && engine.holds(src("AltLeft")));
+        // The emergency stop turns both into orphans, but a disabled engine
+        // gets no more events, so the system key state is authoritative.
+        assert_eq!(run(&mut engine, src("Escape"), true).0, Verdict::Emergency);
+        engine.emergency();
+        assert!(!engine.holds(src("ControlLeft")) && !engine.holds(src("AltLeft")));
+        // Turning remapping back on starts from a clean state.
+        engine.set_enabled(true);
+        assert!(!engine.holds(src("ControlLeft")) && !engine.holds(src("AltLeft")));
+        assert_eq!(
+            run(&mut engine, src("AltLeft"), false),
+            (Verdict::Pass, vec![])
+        );
     }
 
     #[test]
