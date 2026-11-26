@@ -383,6 +383,16 @@ mod tests {
     }
 
     #[test]
+    fn separate_side_buttons_never_take_each_others_release() {
+        let mut buttons = ButtonTracker::default();
+        assert_eq!(buttons.route(3, true, false), Route::Local);
+        buttons.begin();
+        assert_eq!(buttons.route(4, true, true), Route::Forward);
+        assert_eq!(buttons.route(4, false, true), Route::Forward);
+        assert_eq!(buttons.route(3, false, true), Route::Local);
+    }
+
+    #[test]
     fn a_stale_local_button_does_not_trap_the_remote() {
         let mut buttons = ButtonTracker::default();
         buttons.route(0, true, false);

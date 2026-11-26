@@ -445,6 +445,28 @@ pub fn scan_code(scan: u32, extended: bool) -> Option<&'static str> {
 pub fn key_id(scan: u32, extended: bool) -> u32 {
     scan | (u32::from(extended) << 8)
 }
+/// Scan code of a Windows low-level keyboard event. Codes above 0xFF are
+/// synthetic, such as the fake left Ctrl (0x21D) that Windows sends with
+/// AltGr. They stay at 0x200 and above, so they never become a real key id.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub fn ll_scan(scan_code: u32) -> u32 {
+    if scan_code > 0xFF {
+        0x200 | (scan_code & 0xFF)
+    } else {
+        scan_code
+    }
+}
+/// Button index of a Windows X button event: XBUTTON1 (back) is 3 and
+/// XBUTTON2 (forward) is 4, so each keeps its own pressed state.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub fn x_button_index(mouse_data: u32) -> u8 {
+    const XBUTTON2: u16 = 0x0002;
+    if (mouse_data >> 16) as u16 == XBUTTON2 {
+        4
+    } else {
+        3
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum RawEvent {
@@ -2239,8 +2261,8 @@ mod platform {
 #[cfg(target_os = "windows")]
 mod win {
     use super::{
-        Bounds, CaptureLogic, CaptureStatus, Captured, FlowEdge, HookHealth, RawEvent, Verdict,
-        EDGE_INSET_PX,
+        ll_scan, x_button_index, Bounds, CaptureLogic, CaptureStatus, Captured, FlowEdge,
+        HookHealth, RawEvent, Verdict, EDGE_INSET_PX,
     };
     use crate::screen::{self, Layout};
     use std::{
@@ -2532,7 +2554,7 @@ mod win {
                     down: wparam as u32 == WM_RBUTTONDOWN,
                 }),
                 WM_XBUTTONDOWN | WM_XBUTTONUP => Some(RawEvent::Button {
-                    index: 3,
+                    index: x_button_index(info.mouseData),
                     down: wparam as u32 == WM_XBUTTONDOWN,
                 }),
                 WM_MOUSEWHEEL => Some(RawEvent::Wheel {
@@ -2580,7 +2602,7 @@ mod win {
                 let down = info.flags & LLKHF_UP == 0;
                 let injected = info.flags & LLKHF_INJECTED != 0;
                 let event = RawEvent::Key {
-                    scan: info.scanCode & 0xFF,
+                    scan: ll_scan(info.scanCode),
                     extended,
                     down,
                 };
@@ -3829,6 +3851,71 @@ mod tests {
             logic.handle(edge, false, false, s, now).1,
             Some(Captured::EdgeHit { .. })
         ));
+    }
+
+    #[test]
+    fn altgr_fake_ctrl_is_never_a_real_ctrl() {
+        assert_eq!(ll_scan(0x1D), 0x1D);
+        assert_eq!(ll_scan(0xFF), 0xFF);
+        let fake = ll_scan(0x21D);
+        assert!(key_id(fake, false) >= 0x200 && key_id(fake, true) >= 0x200);
+        let altgr = |down| {
+            [
+                key(ll_scan(0x21D), false, down),
+                key(ll_scan(0x38), true, down),
+            ]
+        };
+        let s = &Layout::single(screen());
+        let now = Instant::now();
+        // Locally AltGr+Esc is not Ctrl+Alt+Esc.
+        let mut logic = armed_logic(FlowEdge::Right);
+        for event in altgr(true) {
+            assert_eq!(
+                logic.handle(event, false, false, s, now),
+                (Verdict::Pass, None)
+            );
+        }
+        let esc = key(0x01, false, true);
+        assert!(!logic.needs_modifier_sync(&esc, false));
+        assert_eq!(
+            logic.handle(esc, false, false, s, now),
+            (Verdict::Pass, None)
+        );
+        // Forwarding: only AltRight reaches the remote, never Ctrl or Command.
+        let mut logic = armed_logic(FlowEdge::Right);
+        logic.swap_command_control = true;
+        logic.start_forwarding((960, 540));
+        for down in [true, false] {
+            let [ctrl, alt] = altgr(down);
+            assert_eq!(
+                logic.handle(ctrl, false, true, s, now),
+                (Verdict::Swallow, None)
+            );
+            assert_eq!(
+                logic.handle(alt, false, true, s, now),
+                (Verdict::Swallow, key_out("AltRight", down))
+            );
+        }
+        assert!(logic.end_forwarding("peer").is_empty());
+    }
+
+    #[test]
+    fn back_and_forward_buttons_keep_separate_state() {
+        let (back, forward) = (x_button_index(0x0001_0000), x_button_index(0x0002_0000));
+        assert_eq!((back, forward), (3, 4));
+        let button = |index, down| RawEvent::Button { index, down };
+        let s = &Layout::single(screen());
+        let now = Instant::now();
+        let mut logic = armed_logic(FlowEdge::Right);
+        logic.handle(button(back, true), false, false, s, now);
+        logic.start_forwarding((960, 540));
+        logic.handle(button(forward, true), false, true, s, now);
+        logic.handle(button(forward, false), false, true, s, now);
+        assert_eq!(
+            logic.handle(button(back, false), false, true, s, now),
+            (Verdict::Pass, None),
+            "Back was pressed locally, so its release goes to the local system"
+        );
     }
 
     #[test]
