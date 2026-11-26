@@ -177,7 +177,7 @@ export default function App() {
               {flowSession && !connectingTo ? <Button size="sm" variant="outline" disabled={desktop.busy === "release-flow"} onClick={() => void desktop.returnControl(controlPeer, flowSession)}>Return control</Button> : null}
             </AlertDescription>
           </Alert> : null}
-          {desktop.snapshot?.warnings?.length ? <Alert className="connection-error"><Info /><AlertTitle>Some features need attention</AlertTitle><AlertDescription><ul className="list-disc pl-4">{desktop.snapshot.warnings.map((warning, index) => <li key={index}>{messageFrom(warning)}</li>)}</ul></AlertDescription></Alert> : null}
+          {desktop.snapshot?.warnings?.length ? <Alert className="connection-error"><Info /><AlertTitle>Some features need attention</AlertTitle><AlertDescription className="flex flex-col items-start gap-2"><ul className="list-disc pl-4">{desktop.snapshot.warnings.map((warning, index) => <li key={index}>{messageFrom(warning)}</li>)}</ul>{desktop.snapshot.warningsDismissible ? <Button size="sm" variant="outline" disabled={!!desktop.busy} onClick={() => void desktop.run("dismiss-warnings", () => nativeCommand("dismiss_warnings"))}>Dismiss</Button> : null}</AlertDescription></Alert> : null}
           {desktop.error ? <Alert variant="destructive" className="connection-error"><Info /><AlertTitle>Couldn't refresh the app</AlertTitle><AlertDescription>{desktop.error}<Button size="sm" variant="outline" onClick={() => void desktop.refresh()}>Try again</Button></AlertDescription></Alert> : null}
           <div key={page} className="page-enter">
             <Suspense fallback={<PageLoading label={`Loading ${current?.label ?? "page"}`} />}>
@@ -271,7 +271,7 @@ function CommandMenu({ open, onOpenChange, desktop, theme, onNavigate, onRequest
         <CommandItem value="connect computer pair invitation" disabled={!canAct || !desktop.capabilities.lanPairing} onSelect={() => run(() => onRequest("pair", "connections"))}><Plus />Connect computer</CommandItem>
         <CommandItem value="create profile" disabled={!canAct} onSelect={() => run(() => onRequest("new-profile", "profiles"))}><Plus />Create profile</CommandItem>
         <CommandItem value="create backup" disabled={!canAct} onSelect={() => run(() => onRequest("new-backup", "backups"))}><Plus />Create backup</CommandItem>
-        <CommandItem value="refresh data reload" disabled={!desktop.native} onSelect={() => run(() => void desktop.refresh())}><RefreshCw />Refresh data</CommandItem>
+        <CommandItem value="refresh data reload" disabled={!desktop.native} onSelect={() => run(() => void desktop.refresh(true, { devices: true }))}><RefreshCw />Refresh data</CommandItem>
         <CommandItem value="help how to connect" onSelect={() => run(onHelp)}><CircleHelp />How to connect two computers<CommandShortcut>F1</CommandShortcut></CommandItem>
       </CommandGroup>
       <CommandSeparator />

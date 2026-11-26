@@ -3,7 +3,7 @@ import type { Peer, Profile, Snapshot } from "@traplink/shared";
 
 export type { Backup, Device, KeyMapping, PairingInvite, Platform, Profile, Settings, Snapshot, Transfer } from "@traplink/shared";
 export interface ConnectedPeer extends Peer { flowClipboard?: boolean; permissions?: { clipboard: boolean; files: boolean; input?: boolean } }
-export interface DesktopSnapshot extends Omit<Snapshot, "peers"> { peers: ConnectedPeer[]; warnings?: string[] }
+export interface DesktopSnapshot extends Omit<Snapshot, "peers"> { peers: ConnectedPeer[]; warnings?: string[]; warningsDismissible?: boolean }
 export interface Capabilities {
   cloudBackups?: boolean;
   hidInventory: boolean;

@@ -40,7 +40,7 @@ export function Devices({ desktop, onProfiles }: { desktop: Desktop; onProfiles:
   const devices = (desktop.snapshot?.devices ?? []).filter(device => inputKinds(device).length > 0);
   const filtered = devices.filter(device => `${displayedName(device)} ${inputKindLabel(device)} ${device.manufacturer ?? ""}`.toLocaleLowerCase("en-US").includes(search.toLocaleLowerCase("en-US")));
   return <>
-    <PageHeading title="Devices" description="Keyboards and mice detected on this computer."><Button variant="outline" disabled={!desktop.native || desktop.loading || !!desktop.busy} onClick={() => void desktop.refresh()}><RefreshCw data-icon="inline-start" />Refresh devices</Button></PageHeading>
+    <PageHeading title="Devices" description="Keyboards and mice detected on this computer."><Button variant="outline" disabled={!desktop.native || desktop.loading || !!desktop.busy} onClick={() => void desktop.refresh(true, { devices: true })}><RefreshCw data-icon="inline-start" />Refresh devices</Button></PageHeading>
     <div className="content-stack">
       <div className="list-toolbar"><p>{devices.length} device{devices.length === 1 ? "" : "s"}, with interfaces of the same peripheral grouped</p><Field className="search-field"><FieldLabel htmlFor="device-search"><Search aria-hidden="true" />Search devices</FieldLabel><Input id="device-search" placeholder="Name or manufacturer" value={search} onChange={event => setSearch(event.target.value)} /></Field></div>
       {filtered.length ? <div className="hardware-grid">{filtered.map(device => <Card className="hardware-card" key={device.id}>

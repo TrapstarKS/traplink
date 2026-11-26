@@ -1,6 +1,16 @@
 use crate::model::Device;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Mutex,
+    time::{Duration, Instant},
+};
+
+/// How long periodic snapshots reuse the last device list before enumerating again.
+const INVENTORY_TTL: Duration = Duration::from_secs(10);
+
+type InventoryCache = Mutex<Option<(Instant, Vec<Device>)>>;
+static INVENTORY_CACHE: InventoryCache = Mutex::new(None);
 
 #[derive(Clone)]
 struct Collection {
@@ -104,6 +114,47 @@ fn grouped_inventory(collections: Vec<Collection>) -> Vec<Device> {
 }
 pub fn inventory() -> Result<Vec<Device>, String> {
     crate::hid_thread::run(inventory_now)?
+}
+
+/// Device list for snapshots. Enumerating HID devices is slow and shares the
+/// HID thread with HID++ requests, so periodic refreshes reuse a recent list.
+/// `force` always enumerates (explicit refresh from the Devices page).
+pub fn inventory_cached(force: bool) -> Result<Vec<Device>, String> {
+    cached(
+        &INVENTORY_CACHE,
+        Instant::now(),
+        force,
+        crate::hid_thread::busy(),
+        inventory,
+    )
+}
+
+fn cached(
+    cache: &InventoryCache,
+    now: Instant,
+    force: bool,
+    hid_busy: bool,
+    enumerate: impl FnOnce() -> Result<Vec<Device>, String>,
+) -> Result<Vec<Device>, String> {
+    if !force {
+        let cache = cache
+            .lock()
+            .map_err(|_| "Device list lock is unavailable.")?;
+        if let Some((at, devices)) = cache.as_ref() {
+            // While another HID job is queued or running, the last list is better
+            // than blocking the whole snapshot behind it.
+            if hid_busy || now.saturating_duration_since(*at) < INVENTORY_TTL {
+                return Ok(devices.clone());
+            }
+        }
+    }
+    let devices = enumerate()?;
+    if let Ok(mut cache) = cache.lock() {
+        if !matches!(cache.as_ref(), Some((at, _)) if *at > now) {
+            *cache = Some((now, devices.clone()));
+        }
+    }
+    Ok(devices)
 }
 
 fn inventory_now() -> Result<Vec<Device>, String> {
@@ -283,6 +334,56 @@ mod tests {
         assert_eq!(keyboard.id, "vendor");
         assert_eq!(keyboard.input_kinds, vec!["keyboard"]);
     }
+    fn device(id: &str) -> Device {
+        grouped_inventory(vec![collection(id, id, id, 1, 2)])
+            .pop()
+            .unwrap()
+    }
+
+    #[test]
+    fn snapshot_inventory_is_cached_until_ttl_or_forced() {
+        fn counted<'a>(
+            calls: &'a std::cell::Cell<u32>,
+            id: &'static str,
+        ) -> impl FnOnce() -> Result<Vec<Device>, String> + 'a {
+            move || {
+                calls.set(calls.get() + 1);
+                Ok(vec![device(id)])
+            }
+        }
+        let cache: InventoryCache = Mutex::new(None);
+        let calls = std::cell::Cell::new(0);
+        let enumerate = |id| counted(&calls, id);
+        let start = Instant::now();
+        let first = cached(&cache, start, false, false, enumerate("a")).unwrap();
+        let second = cached(
+            &cache,
+            start + Duration::from_secs(5),
+            false,
+            false,
+            enumerate("b"),
+        );
+        assert_eq!(calls.get(), 1);
+        assert_eq!(first[0].id, second.unwrap()[0].id);
+        let later = start + INVENTORY_TTL + Duration::from_secs(1);
+        let refreshed = cached(&cache, later, false, false, enumerate("c")).unwrap();
+        assert_eq!((calls.get(), refreshed[0].name.as_str()), (2, "c"));
+        let forced = cached(&cache, later, true, false, enumerate("d")).unwrap();
+        assert_eq!((calls.get(), forced[0].name.as_str()), (3, "d"));
+        let busy = cached(&cache, later + INVENTORY_TTL * 3, false, true, enumerate("e"));
+        assert_eq!((calls.get(), busy.unwrap()[0].name.as_str()), (3, "d"));
+    }
+
+    #[test]
+    fn snapshot_inventory_errors_are_not_cached() {
+        let cache: InventoryCache = Mutex::new(None);
+        let start = Instant::now();
+        assert!(cached(&cache, start, false, false, || Err("x".into())).is_err());
+        assert!(cache.lock().unwrap().is_none());
+        let devices = cached(&cache, start, false, true, || Ok(vec![device("a")])).unwrap();
+        assert_eq!(devices.len(), 1);
+    }
+
     #[test]
     fn raw_present_inventory_smoke() {
         let inventory = inventory().unwrap();

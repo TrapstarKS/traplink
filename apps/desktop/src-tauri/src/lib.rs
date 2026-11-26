@@ -63,9 +63,13 @@ async fn select_backup_destination(default_name: Option<String>) -> Result<Optio
 }
 
 #[tauri::command]
-async fn get_snapshot(state: AppState<'_>) -> Result<Snapshot, String> {
+async fn get_snapshot(
+    refresh_devices: Option<bool>,
+    state: AppState<'_>,
+) -> Result<Snapshot, String> {
     let core = state.inner().clone();
-    tokio::task::spawn_blocking(move || core.snapshot())
+    let refresh_devices = refresh_devices.unwrap_or(false);
+    tokio::task::spawn_blocking(move || core.snapshot_with(refresh_devices))
         .await
         .map_err(|_| "Device inventory task failed.".to_string())?
 }
@@ -236,9 +240,15 @@ fn delete_profile(id: String, state: AppState<'_>) -> Result<(), String> {
     Ok(())
 }
 fn reload_remap(core: &Core) {
-    if let Err(error) = remap::apply(core) {
-        core.warning(format!("Remapping could not be updated: {error}"));
+    match remap::apply(core) {
+        Ok(()) => core.clear_warnings(|w| w.starts_with(REMAP_WARNING)),
+        Err(error) => core.warning(format!("{REMAP_WARNING} {error}")),
     }
+}
+const REMAP_WARNING: &str = "Remapping could not be updated:";
+#[tauri::command]
+fn dismiss_warnings(state: AppState<'_>) {
+    state.dismiss_warnings();
 }
 #[tauri::command]
 fn create_backup(name: String, state: AppState<'_>) -> Result<Backup, String> {
@@ -265,7 +275,7 @@ fn create_backup(name: String, state: AppState<'_>) -> Result<Backup, String> {
     storage::write_document(&storage::backup_path(&state.directory, &backup.id)?, &doc)?;
     Ok(backup)
 }
-fn restore(doc: storage::BackupDocument, core: &Core) -> Result<Snapshot, String> {
+fn restore(doc: storage::BackupDocument, core: &Core) -> Result<(), String> {
     doc.validate()?;
     {
         let mut data = core.data.lock().map_err(|_| "Settings lock unavailable.")?;
@@ -283,14 +293,23 @@ fn restore(doc: storage::BackupDocument, core: &Core) -> Result<Snapshot, String
     }
     release_all_input(core);
     reload_remap(core);
-    core.snapshot()
+    Ok(())
+}
+/// Runs a restore off the UI thread. The app refreshes its snapshot afterwards.
+async fn restore_in_background(
+    core: Arc<Core>,
+    read: impl FnOnce(&Core) -> Result<storage::BackupDocument, String> + Send + 'static,
+) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || restore(read(&core)?, &core))
+        .await
+        .map_err(|_| "Backup restore task failed.".to_string())?
 }
 #[tauri::command]
-fn restore_backup(id: String, state: AppState<'_>) -> Result<Snapshot, String> {
-    restore(
-        storage::read_document(&storage::backup_path(&state.directory, &id)?)?,
-        &state,
-    )
+async fn restore_backup(id: String, state: AppState<'_>) -> Result<(), String> {
+    restore_in_background(state.inner().clone(), move |core| {
+        storage::read_document(&storage::backup_path(&core.directory, &id)?)
+    })
+    .await
 }
 #[tauri::command]
 fn delete_backup(id: String, state: AppState<'_>) -> Result<(), String> {
@@ -327,8 +346,11 @@ fn export_backup_file(id: String, path: String, state: AppState<'_>) -> Result<(
     .map_err(|e| e.to_string())
 }
 #[tauri::command]
-fn import_backup_file(path: String, state: AppState<'_>) -> Result<Snapshot, String> {
-    restore(storage::read_document(&PathBuf::from(path))?, &state)
+async fn import_backup_file(path: String, state: AppState<'_>) -> Result<(), String> {
+    restore_in_background(state.inner().clone(), move |_| {
+        storage::read_document(&PathBuf::from(path))
+    })
+    .await
 }
 #[tauri::command]
 fn create_pairing_invite(state: AppState<'_>) -> Result<PairingInvite, String> {
@@ -708,6 +730,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_snapshot,
+            dismiss_warnings,
             get_capabilities,
             upload_cloud_backup,
             download_cloud_backup,
@@ -778,3 +801,45 @@ fn on_run_event(app: &tauri::AppHandle, event: tauri::RunEvent) {
 }
 #[cfg(not(target_os = "macos"))]
 fn on_run_event(_app: &tauri::AppHandle, _event: tauri::RunEvent) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[tokio::test]
+    async fn restore_finishes_while_the_hid_thread_is_busy() {
+        let directory = tempfile::tempdir().unwrap();
+        let core = Core::for_test(directory.path().to_path_buf(), 48372);
+        let settings = core.data.lock().unwrap().settings.clone();
+        let doc = storage::BackupDocument {
+            format: "traplink-backup".into(),
+            version: 1,
+            backup: Backup {
+                id: uuid::Uuid::new_v4().to_string(),
+                name: "Test".into(),
+                created_at: now(),
+                profile_count: 0,
+            },
+            settings,
+            profiles: vec![],
+        };
+        let (release, hold) = std::sync::mpsc::channel::<()>();
+        let job = std::thread::spawn(move || {
+            hid_thread::run(move || hold.recv_timeout(Duration::from_secs(10)))
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !hid_thread::busy() && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        let restored = tokio::time::timeout(
+            Duration::from_secs(2),
+            restore_in_background(core.clone(), move |_| Ok(doc)),
+        )
+        .await;
+        release.send(()).unwrap();
+        let _ = job.join().unwrap();
+        assert!(matches!(restored, Ok(Ok(()))), "{restored:?}");
+        assert!(!core.data.lock().unwrap().settings.input_enabled);
+    }
+}

@@ -275,6 +275,8 @@ pub struct Snapshot {
     pub account: Option<Account>,
     pub permissions: Permissions,
     pub warnings: Vec<String>,
+    /// True when at least one warning can be dismissed from the app.
+    pub warnings_dismissible: bool,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
