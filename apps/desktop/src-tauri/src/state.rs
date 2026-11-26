@@ -31,6 +31,8 @@ pub struct Core {
     pub auth_epoch: AtomicU64,
     pub input: Mutex<crate::input::InputState>,
     pub clipboard: crate::clipboard::Clipboard,
+    /// What each peer already holds, so Flow does not send the same clipboard again.
+    pub clipboard_sync: crate::network::ClipboardLedger,
     pub consent: Mutex<crate::consent::ConsentState>,
     pub client: reqwest::Client,
 }
@@ -66,6 +68,7 @@ impl Core {
             auth_epoch: AtomicU64::new(0),
             input: Mutex::new(Default::default()),
             clipboard: crate::clipboard::Clipboard::in_memory(),
+            clipboard_sync: Default::default(),
             consent: Mutex::new(Default::default()),
             client: reqwest::Client::new(),
         })
@@ -108,6 +111,7 @@ impl Core {
             auth_epoch: AtomicU64::new(0),
             input: Mutex::new(Default::default()),
             clipboard: crate::clipboard::Clipboard::native(),
+            clipboard_sync: Default::default(),
             consent: Mutex::new(Default::default()),
             client,
         }))
