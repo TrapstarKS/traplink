@@ -13,7 +13,8 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { BusyIcon, PageHeading, SecurityNote, StatusBadge } from "@/components/common";
 import { UpdatesPanel } from "@/components/UpdatesPanel";
 import { toast } from "sonner";
-import { chooseDirectory, messageFrom, nativeCommand, type Settings } from "@/lib/bridge";
+import { chooseDirectory, messageFrom, nativeCommand, type DesktopSnapshot, type Settings } from "@/lib/bridge";
+import { mergeSettingsDraft } from "@/lib/settings";
 import type { Desktop } from "@/lib/use-desktop";
 import { useUpdater } from "@/lib/updater";
 
@@ -40,16 +41,24 @@ export function Preferences({ desktop }: { desktop: Desktop }) {
     if (!dirty || draftJson === initialJson) {
       setDraft(JSON.parse(initialJson) as Settings);
       setBaseline(initialJson);
+    } else if (baseline !== initialJson) {
+      // Keep only the user's edits on top of background changes such as an emergency stop.
+      const latest = JSON.parse(initialJson) as Settings;
+      const previous = JSON.parse(baseline) as Settings;
+      setDraft(current => mergeSettingsDraft(latest, previous, current));
+      setBaseline(initialJson);
     }
-  }, [dirty, draftJson, initialJson]);
+  }, [dirty, draftJson, initialJson, baseline]);
 
   function update<K extends keyof Settings>(key: K, value: Settings[K]) { setDraft(current => ({ ...current, [key]: value })); }
   async function save(event: React.FormEvent) {
     event.preventDefault();
     if (!valid || disabled) return;
-    const settings = { ...draft, deviceName: draft.deviceName.trim(), authServerUrl: draft.authServerUrl.trim(), downloadDirectory: draft.downloadDirectory.trim() };
-    const saved = await desktop.run("save-settings", () => nativeCommand("update_settings", { settings }), "Preferences saved.");
-    if (saved) { setDraft(settings); setBaseline(JSON.stringify(settings)); }
+    const base = JSON.parse(baseline) as Settings;
+    const edited = mergeSettingsDraft(desktop.snapshot?.settings ?? base, base, draft);
+    const settings = { ...edited, deviceName: edited.deviceName.trim(), authServerUrl: edited.authServerUrl.trim(), downloadDirectory: edited.downloadDirectory.trim() };
+    const saved = await desktop.run("save-settings", () => nativeCommand<DesktopSnapshot>("update_settings", { settings, base }), "Preferences saved.");
+    if (saved) { setDraft(saved.settings); setBaseline(JSON.stringify(saved.settings)); }
   }
   async function selectDirectory() {
     const path = await desktop.run("choose-directory", chooseDirectory);

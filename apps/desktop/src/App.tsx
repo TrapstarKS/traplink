@@ -112,7 +112,7 @@ export default function App() {
   function changeTheme(next: Theme) {
     if (!desktop.native) { setPreviewTheme(next); return; }
     const settings = desktop.snapshot?.settings;
-    if (settings && settings.theme !== next) void desktop.run("theme", () => nativeCommand("update_settings", { settings: { ...settings, theme: next } }));
+    if (settings && settings.theme !== next) void desktop.run("theme", () => nativeCommand("update_settings", { settings: { ...settings, theme: next }, base: settings }));
   }
 
   useEffect(() => { document.documentElement.dataset.hydrated = "1"; }, []);

@@ -1,24 +1,22 @@
 import { nativeCommand, type ConnectedPeer, type DesktopSnapshot, type Settings } from "./bridge";
+import { globalSwitch, maskedGrantRevocations, permissionsOf, type PeerFeature, type PeerPermissions } from "./permission-rules";
 
-export type PeerFeature = "clipboard" | "files" | "input";
-type PeerPermissions = { clipboard: boolean; files: boolean; input: boolean };
-
-const globalSwitch: Record<PeerFeature, "clipboardEnabled" | "fileSharingEnabled" | "inputEnabled"> = {
-  clipboard: "clipboardEnabled",
-  files: "fileSharingEnabled",
-  input: "inputEnabled",
-};
+export type { PeerFeature } from "./permission-rules";
 
 export async function allowLocally(peerId: string, features: PeerFeature[]): Promise<void> {
   const snapshot = await nativeCommand<DesktopSnapshot>("get_snapshot");
+  const peer = snapshot.peers.find(item => item.id === peerId);
+  if (!peer) throw new Error("Unknown peer.");
+  // Grants other computers kept while a switch was off must not come back with it.
+  for (const change of maskedGrantRevocations(snapshot.peers, peerId, snapshot.settings, features)) {
+    await nativeCommand("set_peer_permissions", change);
+  }
   const missing = features.filter(feature => !snapshot.settings[globalSwitch[feature]]);
   if (missing.length) {
     const settings: Settings = { ...snapshot.settings };
     for (const feature of missing) settings[globalSwitch[feature]] = true;
-    await nativeCommand("update_settings", { settings });
+    await nativeCommand("update_settings", { settings, base: snapshot.settings });
   }
-  const peer = snapshot.peers.find(item => item.id === peerId);
-  if (!peer) throw new Error("Unknown peer.");
   const current = permissionsOf(peer);
   const next: PeerPermissions = {
     clipboard: current.clipboard || features.includes("clipboard"),
@@ -32,10 +30,6 @@ export async function allowLocally(peerId: string, features: PeerFeature[]): Pro
 
 export async function revokeForPeer(peer: ConnectedPeer, feature: PeerFeature): Promise<void> {
   await nativeCommand("set_peer_permissions", { id: peer.id, ...permissionsOf(peer), [feature]: false });
-}
-
-function permissionsOf(peer: ConnectedPeer): PeerPermissions {
-  return { clipboard: !!peer.permissions?.clipboard, files: !!peer.permissions?.files, input: !!peer.permissions?.input };
 }
 
 export async function askPeerForInput(peerId: string, flow: boolean): Promise<"granted" | "outdated"> {

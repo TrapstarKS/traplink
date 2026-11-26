@@ -112,39 +112,121 @@ async fn set_fn_inversion(
         .await
         .map_err(|_| "Keyboard configuration failed.".to_string())?
 }
+fn pick<T: PartialEq + Clone>(current: &T, base: &T, next: &T) -> T {
+    if next != base {
+        next.clone()
+    } else {
+        current.clone()
+    }
+}
+/// Applies only the fields the caller changed (`next` differs from the `base` it
+/// edited) on top of the current settings, so a stale copy cannot undo changes made
+/// in the background, such as an emergency stop or a consent grant. Remapping is
+/// owned by its own command and always keeps the current value.
+fn merge_settings(current: &Settings, base: &Settings, next: &Settings) -> Settings {
+    Settings {
+        device_name: pick(&current.device_name, &base.device_name, &next.device_name),
+        auth_server_url: pick(
+            &current.auth_server_url,
+            &base.auth_server_url,
+            &next.auth_server_url,
+        ),
+        clipboard_enabled: pick(
+            &current.clipboard_enabled,
+            &base.clipboard_enabled,
+            &next.clipboard_enabled,
+        ),
+        file_sharing_enabled: pick(
+            &current.file_sharing_enabled,
+            &base.file_sharing_enabled,
+            &next.file_sharing_enabled,
+        ),
+        input_enabled: pick(&current.input_enabled, &base.input_enabled, &next.input_enabled),
+        start_on_login: pick(
+            &current.start_on_login,
+            &base.start_on_login,
+            &next.start_on_login,
+        ),
+        theme: pick(&current.theme, &base.theme, &next.theme),
+        download_directory: pick(
+            &current.download_directory,
+            &base.download_directory,
+            &next.download_directory,
+        ),
+        port: pick(&current.port, &base.port, &next.port),
+        remap_enabled: current.remap_enabled,
+    }
+}
+/// Resolves the settings to store. Without a base the caller's copy replaces the
+/// current settings, as older webviews expect.
+fn resolve_settings(current: &Settings, next: &Settings, base: Option<&Settings>) -> Settings {
+    match base {
+        Some(base) => merge_settings(current, base, next),
+        None => Settings {
+            remap_enabled: current.remap_enabled,
+            ..next.clone()
+        },
+    }
+}
+struct SettingsChange {
+    port_changed: bool,
+    server_changed: bool,
+    input_revoked: bool,
+    input_turned_on: bool,
+}
+/// Merges against the state under the lock and saves. `start_on_login` is the
+/// value the OS reports after the autostart change.
+fn commit_settings(
+    core: &Core,
+    next: &Settings,
+    base: Option<&Settings>,
+    start_on_login: Option<bool>,
+) -> Result<SettingsChange, String> {
+    let mut data = core.data.lock().map_err(|_| "Settings lock unavailable.")?;
+    let mut settings = resolve_settings(&data.settings, next, base);
+    if let Some(start_on_login) = start_on_login {
+        settings.start_on_login = start_on_login;
+    }
+    settings.validate()?;
+    let change = SettingsChange {
+        port_changed: data.settings.port != settings.port,
+        server_changed: data.settings.auth_server_url != settings.auth_server_url,
+        input_revoked: data.settings.input_enabled && !settings.input_enabled,
+        input_turned_on: !data.settings.input_enabled && settings.input_enabled,
+    };
+    let mut updated = data.clone();
+    if change.input_revoked {
+        updated.flow_peers.clear();
+    }
+    updated.settings = settings;
+    storage::save(&core.directory, &updated)?;
+    *data = updated;
+    Ok(change)
+}
 #[tauri::command]
 async fn update_settings(
     settings: Settings,
+    base: Option<Settings>,
     app: tauri::AppHandle,
     state: AppState<'_>,
 ) -> Result<Snapshot, String> {
     let _gate = state.auth_gate.lock().await;
-    let mut settings = settings;
-    settings.validate()?;
-    settings.start_on_login = background::set_autostart(&app, settings.start_on_login)?;
-    ensure_emergency_shortcut(&app, settings.input_enabled)?;
-    let (port_changed, server_changed, input_revoked, input_turned_on) = {
-        let mut data = state
+    let merged = {
+        let data = state
             .data
             .lock()
             .map_err(|_| "Settings lock unavailable.")?;
-        let changed = (
-            data.settings.port != settings.port,
-            data.settings.auth_server_url != settings.auth_server_url,
-            data.settings.input_enabled && !settings.input_enabled,
-            !data.settings.input_enabled && settings.input_enabled,
-        );
-        let mut updated = data.clone();
-        if data.settings.input_enabled && !settings.input_enabled {
-            updated.flow_peers.clear();
-        }
-        let remap_enabled = updated.settings.remap_enabled;
-        updated.settings = settings;
-        updated.settings.remap_enabled = remap_enabled;
-        storage::save(&state.directory, &updated)?;
-        *data = updated;
-        changed
+        resolve_settings(&data.settings, &settings, base.as_ref())
     };
+    merged.validate()?;
+    let start_on_login = background::set_autostart(&app, merged.start_on_login)?;
+    ensure_emergency_shortcut(&app, merged.input_enabled)?;
+    let SettingsChange {
+        port_changed,
+        server_changed,
+        input_revoked,
+        input_turned_on,
+    } = commit_settings(&state, &settings, base.as_ref(), Some(start_on_login))?;
     if port_changed || input_revoked {
         release_all_input(&state);
     }
@@ -467,21 +549,45 @@ async fn respond_input_consent(
     }
     if allow { result } else { Ok(()) }
 }
+/// Allows input from one peer. While mouse and keyboard was off, the stored grants
+/// of other peers were hidden, so turning it on for this peer revokes them instead
+/// of silently reactivating them. Returns the peers whose grant was revoked.
+fn grant_peer_input(data: &mut Persisted, peer_id: &str) -> Result<Vec<String>, String> {
+    if !data.peers.iter().any(|p| p.peer.id == peer_id) {
+        return Err("Unknown peer.".into());
+    }
+    let mut revoked = Vec::new();
+    if !data.settings.input_enabled {
+        for peer in data.peers.iter_mut() {
+            if peer.peer.id != peer_id && peer.peer.permissions.input {
+                peer.peer.permissions.input = false;
+                revoked.push(peer.peer.id.clone());
+            }
+        }
+        for id in &revoked {
+            data.forget_flow(id);
+        }
+    }
+    for peer in data.peers.iter_mut().filter(|p| p.peer.id == peer_id) {
+        peer.peer.permissions.input = true;
+    }
+    data.settings.input_enabled = true;
+    Ok(revoked)
+}
 fn grant_input(app: &tauri::AppHandle, core: &Core, peer_id: &str) -> Result<(), String> {
     ensure_emergency_shortcut(app, true)?;
     let mut data = core.data.lock().map_err(|_| "Settings lock unavailable.")?;
     let mut updated = data.clone();
-    updated
-        .peers
-        .iter_mut()
-        .find(|p| p.peer.id == peer_id)
-        .ok_or("Unknown peer.")?
-        .peer
-        .permissions
-        .input = true;
-    updated.settings.input_enabled = true;
+    let revoked = grant_peer_input(&mut updated, peer_id)?;
     storage::save(&core.directory, &updated)?;
     *data = updated;
+    drop(data);
+    for id in revoked {
+        let active = input::stop_peer(core, &id);
+        if let Ok(link) = network::session(core, &id) {
+            link.notify_input_stop(active);
+        }
+    }
     Ok(())
 }
 #[tauri::command]
@@ -778,3 +884,166 @@ fn on_run_event(app: &tauri::AppHandle, event: tauri::RunEvent) {
 }
 #[cfg(not(target_os = "macos"))]
 fn on_run_event(_app: &tauri::AppHandle, _event: tauri::RunEvent) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn settings() -> Settings {
+        let mut settings = Settings::defaults("C:/Downloads".into());
+        settings.device_name = "A".into();
+        settings
+    }
+
+    fn peer(id: &str, input: bool) -> TrustedPeer {
+        TrustedPeer {
+            peer: Peer {
+                flow_clipboard: false,
+                id: id.into(),
+                name: id.into(),
+                address: "127.0.0.1:48373".into(),
+                platform: "windows".into(),
+                fingerprint: "test".into(),
+                connected: false,
+                trusted: true,
+                last_seen: None,
+                permissions: PeerPermissions {
+                    clipboard: false,
+                    files: false,
+                    input,
+                },
+            },
+            public_key: String::new(),
+        }
+    }
+
+    fn saved_flow(peer: &str, edge: FlowEdge) -> SavedFlow {
+        SavedFlow {
+            peer: peer.into(),
+            edge,
+            mode: FlowMode::Edge,
+            delay_ms: 250,
+            block_while_button: true,
+            clipboard: false,
+        }
+    }
+
+    #[test]
+    fn merge_keeps_background_changes_the_caller_did_not_edit() {
+        let mut current = settings();
+        current.input_enabled = false;
+        current.remap_enabled = true;
+        let mut base = settings();
+        base.input_enabled = true;
+        let mut next = base.clone();
+        next.device_name = "B".into();
+        next.remap_enabled = false;
+        let merged = merge_settings(&current, &base, &next);
+        assert!(!merged.input_enabled);
+        assert_eq!(merged.device_name, "B");
+        assert!(merged.remap_enabled);
+
+        let mut current = settings();
+        current.input_enabled = true;
+        current.clipboard_enabled = true;
+        let base = settings();
+        let merged = merge_settings(&current, &base, &base.clone());
+        assert!(merged.input_enabled);
+        assert!(merged.clipboard_enabled);
+    }
+
+    #[test]
+    fn merge_applies_fields_the_caller_changed() {
+        let current = settings();
+        let base = settings();
+        let mut next = settings();
+        next.input_enabled = true;
+        next.theme = "light".into();
+        next.port = 50000;
+        let merged = merge_settings(&current, &base, &next);
+        assert!(merged.input_enabled);
+        assert_eq!(merged.theme, "light");
+        assert_eq!(merged.port, 50000);
+    }
+
+    #[test]
+    fn stale_settings_save_does_not_undo_an_emergency_stop() {
+        let directory = tempfile::tempdir().unwrap();
+        let core = Core::for_test(directory.path().to_path_buf(), 48372);
+        let base = {
+            let mut data = core.data.lock().unwrap();
+            data.settings.input_enabled = true;
+            data.flow_peers.push(saved_flow("peer-a", FlowEdge::Right));
+            data.settings.clone()
+        };
+        stop_all_input(&core, true);
+        let mut stale = base.clone();
+        stale.device_name = "Renamed".into();
+        let change = commit_settings(&core, &stale, Some(&base), None).unwrap();
+        assert!(!change.input_turned_on);
+        let data = core.data.lock().unwrap();
+        assert!(!data.settings.input_enabled);
+        assert_eq!(data.settings.device_name, "Renamed");
+        let saved = storage::load(&core.directory, String::new()).unwrap();
+        assert!(!saved.settings.input_enabled);
+        assert_eq!(saved.settings.device_name, "Renamed");
+    }
+
+    #[test]
+    fn settings_without_a_base_replace_the_current_copy() {
+        let directory = tempfile::tempdir().unwrap();
+        let core = Core::for_test(directory.path().to_path_buf(), 48372);
+        let mut next = core.data.lock().unwrap().settings.clone();
+        core.data.lock().unwrap().settings.remap_enabled = true;
+        next.clipboard_enabled = true;
+        next.remap_enabled = false;
+        commit_settings(&core, &next, None, None).unwrap();
+        let data = core.data.lock().unwrap();
+        assert!(data.settings.clipboard_enabled);
+        assert!(data.settings.remap_enabled);
+    }
+
+    #[test]
+    fn granting_input_while_off_revokes_other_masked_grants() {
+        let directory = tempfile::tempdir().unwrap();
+        let core = Core::for_test(directory.path().to_path_buf(), 48372);
+        let mut data = core.data.lock().unwrap().clone();
+        data.settings.input_enabled = false;
+        data.peers = vec![peer("a", true), peer("b", true), peer("c", false)];
+        data.flow_peers = vec![
+            saved_flow("a", FlowEdge::Left),
+            saved_flow("b", FlowEdge::Right),
+        ];
+        let revoked = grant_peer_input(&mut data, "b").unwrap();
+        assert_eq!(revoked, vec!["a".to_string()]);
+        assert!(data.settings.input_enabled);
+        let input = |id: &str| {
+            data.peers
+                .iter()
+                .find(|p| p.peer.id == id)
+                .unwrap()
+                .peer
+                .permissions
+                .input
+        };
+        assert!(!input("a"));
+        assert!(input("b"));
+        assert!(!input("c"));
+        assert!(data.flow_peers.iter().all(|f| f.peer != "a"));
+        assert!(data.flow_peers.iter().any(|f| f.peer == "b"));
+    }
+
+    #[test]
+    fn granting_input_while_on_keeps_other_grants() {
+        let directory = tempfile::tempdir().unwrap();
+        let core = Core::for_test(directory.path().to_path_buf(), 48372);
+        let mut data = core.data.lock().unwrap().clone();
+        data.settings.input_enabled = true;
+        data.peers = vec![peer("a", true), peer("b", false)];
+        data.flow_peers = vec![saved_flow("a", FlowEdge::Left)];
+        assert!(grant_peer_input(&mut data, "b").unwrap().is_empty());
+        assert!(data.peers.iter().all(|p| p.peer.permissions.input));
+        assert_eq!(data.flow_peers.len(), 1);
+        assert!(grant_peer_input(&mut data, "missing").is_err());
+    }
+}
