@@ -105,7 +105,8 @@ function PairingDialog({ desktop, open, onOpenChange }: { desktop: Desktop; open
   const [now, setNow] = useState(Date.now);
   const remaining = invite ? Math.max(0, Math.ceil((Date.parse(invite.expiresAt) - now) / 1000)) : 0;
   const baseline = useRef<InviteBaseline>(inviteBaseline([]));
-  const state = invite ? inviteState(invite, desktop.snapshot?.pairingCode, desktop.snapshot?.peers ?? [], baseline.current, now) : null;
+  // Judge expiry with the current time, not the once-per-second tick, so a snapshot taken just after expiry is not read as a live invite.
+  const state = invite ? inviteState(invite, desktop.snapshot?.pairingCode, desktop.snapshot?.peers ?? [], baseline.current, Math.max(now, Date.now())) : null;
   const inviteAvailable = state?.kind === "available";
   const pairedPeer = state?.kind === "paired" ? state.peer : null;
   const { refresh } = desktop;

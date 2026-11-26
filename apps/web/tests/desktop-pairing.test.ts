@@ -29,4 +29,14 @@ describe('inviteState', () => {
     expect(inviteState(invite, null, [desk], inviteBaseline([desk]), after)).toEqual({ kind: 'expired' });
     expect(inviteState(invite, 'ABC-123', [desk], inviteBaseline([desk]), after)).toEqual({ kind: 'expired' });
   });
+
+  it('does not report a reconnecting known computer as paired after the invite expired', () => {
+    // The core drops expired invites from the snapshot, so pairingCode is null here.
+    const offline = { ...laptop, connected: false };
+    expect(inviteState(invite, null, [desk, laptop], inviteBaseline([desk, offline]), after)).toEqual({ kind: 'expired' });
+  });
+
+  it('still reports a new computer whose pairing is first seen after the deadline', () => {
+    expect(inviteState(invite, null, [desk, laptop], inviteBaseline([desk]), after)).toEqual({ kind: 'paired', peer: { id: 'laptop', name: 'Laptop' } });
+  });
 });
