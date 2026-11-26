@@ -574,11 +574,56 @@ fn grant_peer_input(data: &mut Persisted, peer_id: &str) -> Result<Vec<String>, 
     data.settings.input_enabled = true;
     Ok(revoked)
 }
+/// Joins names as "A", "A and B" or "A, B and C".
+fn join_names(names: &[String]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+/// Tells the user which computers lost mouse and keyboard (and their saved Flow
+/// setup) because allowing `granted` turned the global switch back on.
+fn revoked_input_notice(before: &Persisted, granted: &str, revoked: &[String]) -> Option<String> {
+    if revoked.is_empty() {
+        return None;
+    }
+    let name = |id: &str| {
+        before
+            .peers
+            .iter()
+            .find(|p| p.peer.id == id)
+            .map_or_else(|| id.to_string(), |p| p.peer.name.clone())
+    };
+    let names: Vec<String> = revoked.iter().map(|id| name(id.as_str())).collect();
+    let with_flow: Vec<String> = revoked
+        .iter()
+        .filter(|id| before.flow_peers.iter().any(|f| f.peer == **id))
+        .map(|id| name(id.as_str()))
+        .collect();
+    let flow = if with_flow.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " Any saved Flow setup with {} was removed.",
+            join_names(&with_flow)
+        )
+    };
+    Some(format!(
+        "Allowing {} turned off mouse and keyboard for {}.{flow} Allow them again in Permissions if needed.",
+        name(granted),
+        join_names(&names)
+    ))
+}
 fn grant_input(app: &tauri::AppHandle, core: &Core, peer_id: &str) -> Result<(), String> {
     ensure_emergency_shortcut(app, true)?;
+    commit_input_grant(core, peer_id)
+}
+fn commit_input_grant(core: &Core, peer_id: &str) -> Result<(), String> {
     let mut data = core.data.lock().map_err(|_| "Settings lock unavailable.")?;
     let mut updated = data.clone();
     let revoked = grant_peer_input(&mut updated, peer_id)?;
+    let notice = revoked_input_notice(&data, peer_id, &revoked);
     storage::save(&core.directory, &updated)?;
     *data = updated;
     drop(data);
@@ -587,6 +632,9 @@ fn grant_input(app: &tauri::AppHandle, core: &Core, peer_id: &str) -> Result<(),
         if let Ok(link) = network::session(core, &id) {
             link.notify_input_stop(active);
         }
+    }
+    if let Some(notice) = notice {
+        core.warning(notice);
     }
     Ok(())
 }
@@ -1045,5 +1093,44 @@ mod tests {
         assert!(data.peers.iter().all(|p| p.peer.permissions.input));
         assert_eq!(data.flow_peers.len(), 1);
         assert!(grant_peer_input(&mut data, "missing").is_err());
+    }
+
+    #[test]
+    fn granting_input_names_the_computers_it_turned_off() {
+        let directory = tempfile::tempdir().unwrap();
+        let core = Core::for_test(directory.path().to_path_buf(), 48372);
+        {
+            let mut data = core.data.lock().unwrap();
+            data.settings.input_enabled = false;
+            data.peers = vec![peer("a", true), peer("b", false), peer("c", true)];
+            data.peers[0].peer.name = "Laptop".into();
+            data.flow_peers = vec![saved_flow("a", FlowEdge::Left)];
+        }
+        commit_input_grant(&core, "b").unwrap();
+        let warnings = core.warnings.lock().unwrap().clone();
+        assert_eq!(
+            warnings,
+            vec!["Allowing b turned off mouse and keyboard for Laptop and c. Any saved Flow setup with Laptop was removed. Allow them again in Permissions if needed.".to_string()]
+        );
+        let saved = storage::load(&core.directory, String::new()).unwrap();
+        assert!(saved.settings.input_enabled);
+        assert!(saved.flow_peers.is_empty());
+    }
+
+    #[test]
+    fn granting_input_while_on_adds_no_notice() {
+        let directory = tempfile::tempdir().unwrap();
+        let core = Core::for_test(directory.path().to_path_buf(), 48372);
+        {
+            let mut data = core.data.lock().unwrap();
+            data.settings.input_enabled = true;
+            data.peers = vec![peer("a", true), peer("b", false)];
+        }
+        commit_input_grant(&core, "b").unwrap();
+        assert!(core.warnings.lock().unwrap().is_empty());
+        assert_eq!(
+            join_names(&["A".into(), "B".into(), "C".into()]),
+            "A, B and C"
+        );
     }
 }

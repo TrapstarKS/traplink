@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { mergeSettingsDraft } from '../../desktop/src/lib/settings';
-import { maskedGrantRevocations, needsInputGrantDisclosure } from '../../desktop/src/lib/permission-rules';
+import { joinNames, maskedGrantRevocations, needsInputGrantDisclosure, revocationNotice } from '../../desktop/src/lib/permission-rules';
+import { singleFlight } from '../../desktop/src/lib/single-flight';
 
 type Settings = Parameters<typeof mergeSettingsDraft>[0];
 
@@ -72,5 +73,55 @@ describe('maskedGrantRevocations', () => {
 
   it('leaves other computers alone when the switch is already on', () => {
     expect(maskedGrantRevocations(peers, 'b', settings({ inputEnabled: true }), ['input'])).toEqual([]);
+  });
+});
+
+describe('revocationNotice', () => {
+  const peers = [
+    { id: 'a', name: 'Laptop', permissions: { clipboard: true, files: true, input: true } },
+    { id: 'b', name: 'Tablet', permissions: { clipboard: false, files: false, input: true } },
+    { id: 'c', name: 'Desk', permissions: { clipboard: true, files: false, input: false } },
+  ];
+
+  it('names every computer and feature a grant turns off', () => {
+    const changes = maskedGrantRevocations(peers, 'b', settings(), ['input', 'clipboard']);
+    expect(revocationNotice(peers, changes, 'before')).toBe(
+      'This also turns off mouse and keyboard for Laptop; clipboard for Laptop and Desk. Any saved Flow setup with Laptop is removed. Allow them again in Permissions if needed.',
+    );
+    expect(revocationNotice(peers, maskedGrantRevocations(peers, 'a', settings(), ['input']), 'after')).toBe(
+      'Turned off mouse and keyboard for Tablet. Any saved Flow setup with Tablet was removed. Allow them again in Permissions if needed.',
+    );
+    expect(revocationNotice(peers, maskedGrantRevocations(peers, 'b', settings(), ['clipboard']), 'after')).toBe(
+      'Turned off clipboard for Laptop and Desk. Allow them again in Permissions if needed.',
+    );
+  });
+
+  it('says nothing when no other computer loses access', () => {
+    expect(revocationNotice(peers, maskedGrantRevocations(peers, 'b', settings({ inputEnabled: true }), ['input']), 'after')).toBeNull();
+    expect(joinNames(['A', 'B', 'C'])).toBe('A, B and C');
+  });
+});
+
+describe('singleFlight', () => {
+  it('ignores a second call while the first is still running', async () => {
+    const run = singleFlight();
+    let calls = 0;
+    let release = () => {};
+    const task = () => { calls += 1; return new Promise<string>(resolve => { release = () => resolve('done'); }); };
+    const first = run(task);
+    const second = run(task);
+    expect(calls).toBe(1);
+    expect(await second).toBeUndefined();
+    release();
+    expect(await first).toBe('done');
+    const third = run(async () => { calls += 1; return 'again'; });
+    expect(await third).toBe('again');
+    expect(calls).toBe(2);
+  });
+
+  it('accepts new calls after a task fails', async () => {
+    const run = singleFlight();
+    await expect(run(async () => { throw new Error('boom'); })).rejects.toThrow('boom');
+    expect(await run(async () => 'ok')).toBe('ok');
   });
 });
