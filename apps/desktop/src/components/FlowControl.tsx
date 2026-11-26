@@ -10,10 +10,11 @@ import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectVa
 import { Spinner } from "@/components/ui/spinner";
 import { Switch } from "@/components/ui/switch";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
-import { Disclosure } from "@/components/common";
+import { ConfirmDialog, Disclosure } from "@/components/common";
 import { MacPermissionAlert } from "@/components/MacPermissionAlert";
-import { messageFrom, nativeAvailable, nativeCommand, type ConnectedPeer } from "@/lib/bridge";
+import { messageFrom, nativeAvailable, nativeCommand, type ConnectedPeer, type DesktopSnapshot } from "@/lib/bridge";
 import { allowLocally, askPeerForInput, macPermissionPanes, type MacPane } from "@/lib/permissions";
+import { needsInputGrantDisclosure } from "@/lib/permission-rules";
 
 export type FlowEdge = "left" | "right" | "top" | "bottom";
 export type FlowMode = "edge" | "ctrl_edge";
@@ -74,6 +75,7 @@ export function FlowControl({ peer, peers, available, clipboardSupported, clipbo
   const [repairing, setRepairing] = useState(false);
   const [readError, setReadError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [confirmingGrant, setConfirmingGrant] = useState(false);
   const mounted = useRef(true);
   const operation = useRef(false);
   const reading = useRef(false);
@@ -124,6 +126,17 @@ export function FlowControl({ peer, peers, available, clipboardSupported, clipbo
     if (mounted.current) { setSaving(false); setWaiting(false); setRepairing(false); void refresh(); }
   }
 
+  // Flow uses one pair permission, so turning it on also lets the peer control this computer.
+  async function requestTurnOn() {
+    if (operation.current) return;
+    let disclose: boolean;
+    try {
+      const snapshot = await nativeCommand<DesktopSnapshot>("get_snapshot");
+      disclose = needsInputGrantDisclosure(snapshot.peers.find(item => item.id === peer.id), snapshot.settings);
+    } catch (error) { fail(error); return; }
+    if (!mounted.current) return;
+    if (disclose) setConfirmingGrant(true); else void turnOn();
+  }
   async function turnOn() {
     if (!beginOperation()) return;
     setMacPanes(null);
@@ -232,11 +245,12 @@ export function FlowControl({ peer, peers, available, clipboardSupported, clipbo
     : edgeTaken ? assigned.size === edges.length ? "All edges are assigned. Open another computer’s Flow settings to free an edge." : "Choose an available edge before turning Flow on."
     : !peer.connected ? `Reconnect ${peer.name} to turn Flow on.`
     : saved ? "Your edge settings are saved. Turn Flow on to use them again."
-    : "Choose an edge, then turn Flow on to request access on the other computer.";
+    : `Choose an edge, then turn Flow on to request access on the other computer. Turning it on also lets ${peer.name} control this computer.`;
   const canRepair = active && !controlling && !connecting && !readError && (connectionNeedsHelp || !connected || !!error || status?.capture?.installed === false);
 
   return <section className="input-control flow-control" aria-label={`Flow with ${peer.name}`}>
-    <div className="flow-heading">{heading}<Switch id={`flow-${peer.id}`} aria-label={`Flow with ${peer.name}`} checked={!!active} disabled={saving || (!active && (!peer.connected || !status || !!readError || edgeTaken))} onCheckedChange={value => void (value ? turnOn() : turnOff())} /></div>
+    <div className="flow-heading">{heading}<Switch id={`flow-${peer.id}`} aria-label={`Flow with ${peer.name}`} checked={!!active} disabled={saving || (!active && (!peer.connected || !status || !!readError || edgeTaken))} onCheckedChange={value => void (value ? requestTurnOn() : turnOff())} /></div>
+    <ConfirmDialog open={confirmingGrant} onOpenChange={setConfirmingGrant} title={`Let ${peer.name} control this computer too?`} description={`Turning on Flow also lets ${peer.name} control this computer without asking. You can turn this off in Permissions for ${peer.name}.`} action="Turn on Flow" onConfirm={() => { setConfirmingGrant(false); void turnOn(); }} />
     <span role="status" aria-atomic="true" className="sr-only">{liveStatus}</span>
     <div className="flow-state-panel">
       <div className="flow-state-heading">
