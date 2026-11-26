@@ -183,6 +183,35 @@ describe('real authentication and device authorization', () => {
     expect(result.user.id).toBe(alice.id);
   });
 
+  it('only sweeps after Better Auth accepts the code request', async () => {
+    const issued: string[] = [];
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const response = await authRequest('/device/code', { client_id: 'traplink-desktop' });
+      expect(response.status).toBe(200);
+      issued.push((await response.json()).user_code);
+    }
+    const stale = issued[0];
+    db.prepare("UPDATE deviceCode SET expiresAt = '2000-01-01T00:00:00.000Z' WHERE userCode = ?").run(stale);
+    const codeCount = () => (db.prepare('SELECT count(*) AS count FROM deviceCode WHERE userCode = ?').get(stale) as { count: number }).count;
+    // Better Auth's /device/code limit (5/min) rejects this one; it must not reach the sweep.
+    expect((await authRequest('/device/code', { client_id: 'traplink-desktop' })).status).toBe(429);
+    expect(codeCount()).toBe(1);
+    db.prepare('DELETE FROM request_limits').run();
+    expect((await authRequest('/device/code', { client_id: 'traplink-desktop' })).status).toBe(200);
+    expect(codeCount()).toBe(0);
+  });
+
+  it('still issues a code when the cleanup sweep fails', async () => {
+    db.exec('ALTER TABLE device_approval_claims RENAME TO device_approval_claims_hidden');
+    try {
+      const response = await authRequest('/device/code', { client_id: 'traplink-desktop' });
+      expect(response.status).toBe(200);
+      expect((await response.json()).user_code).toBeTypeOf('string');
+    } finally {
+      db.exec('ALTER TABLE device_approval_claims_hidden RENAME TO device_approval_claims');
+    }
+  });
+
   it('reports unknown and expired user codes with the same error code', async () => {
     const code = await (await authRequest('/device/code', { client_id: 'traplink-desktop' })).json();
     const typo = `${code.user_code.slice(0, 7)}${code.user_code.endsWith('Z') ? 'Y' : 'Z'}`;

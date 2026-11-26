@@ -63,18 +63,23 @@ export async function handleAuthRequest(request: Request, db: AppDatabase, confi
     if (/^bearer\s/i.test(request.headers.get('authorization') ?? '')) {
       throw new ApiError(400, 'invalid_request', 'Bearer credentials are not accepted here.');
     }
-    if (request.method === 'POST' && path === '/device/code') {
+    const isCodeRequest = request.method === 'POST' && path === '/device/code';
+    if (isCodeRequest) {
       const body = await readJson(request.clone(), codeBody);
       if (body.scope?.split(/\s+/).some(scope => scope && !['devices', 'backups'].includes(scope))) {
         throw new ApiError(400, 'invalid_scope', 'Only device and backup access can be requested.');
       }
-      sweepExpiredDeviceAuthorization(db);
     }
     if ((request.method === 'GET' && path === '/device') ||
         (request.method === 'POST' && ['/device/approve', '/device/deny'].includes(path))) {
       await guardBrowserApproval(request, db, auth, path);
     }
     const response = await auth.handler(request);
+    if (isCodeRequest && response.ok) {
+      // Sweep only after Better Auth accepted the request, so its /device/code rate limit also bounds
+      // this write. Cleanup is best effort and must not turn an issued code into an error.
+      try { sweepExpiredDeviceAuthorization(db); } catch { /* retried on the next issued code */ }
+    }
     response.headers.set('Cache-Control', 'no-store');
     response.headers.set('Pragma', 'no-cache');
     return response;
