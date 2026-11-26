@@ -208,13 +208,7 @@ mod tests {
 
     #[test]
     fn tray_status_reports_both_features() {
-        assert_eq!(
-            status_text(true, false),
-            "Flow on · Remapping off"
-        );
-        assert_eq!(
-            status_text(false, true),
-            "Flow off · Remapping on"
-        );
+        assert_eq!(status_text(true, false), "Flow on · Remapping off");
+        assert_eq!(status_text(false, true), "Flow off · Remapping on");
     }
 }

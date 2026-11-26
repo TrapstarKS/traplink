@@ -124,7 +124,9 @@ pub fn codes() -> impl Iterator<Item = &'static str> {
 }
 pub fn code_for_scan(scan: u32, extended: bool) -> Option<&'static str> {
     let id = u16::try_from(scan).ok().filter(|s| *s <= 0xFF)? | if extended { EXT } else { 0 };
-    KEYS.iter().find(|(_, s, _)| *s == id).map(|(code, _, _)| *code)
+    KEYS.iter()
+        .find(|(_, s, _)| *s == id)
+        .map(|(code, _, _)| *code)
 }
 pub fn scan_for_code(code: &str) -> Option<(u16, bool)> {
     KEYS.iter()
@@ -290,7 +292,10 @@ mod tests {
         assert_eq!(mac_for_code("Backquote", true), Some(0x0A));
         assert_eq!(mac_for_code("ContextMenu", false), None);
         assert_eq!(mac_for_code("Nope", false), None);
-        assert_eq!(swap_command_control(swap_command_control("MetaLeft")), "MetaLeft");
+        assert_eq!(
+            swap_command_control(swap_command_control("MetaLeft")),
+            "MetaLeft"
+        );
     }
 
     #[test]

@@ -1,4 +1,3 @@
-
 use hidapi::{BusType, DeviceInfo, HidApi, HidDevice};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -822,9 +821,10 @@ fn read_battery_status(
 mod tests {
     use super::*;
 
-    fn battery(
-        script: Vec<(u8, u8, Vec<u8>, Result<Vec<u8>, ProtocolError>)>,
-    ) -> (BatteryStatus, Result<(), ProtocolError>, bool) {
+    /// One scripted HID++ exchange: feature, function, expected params and the reply.
+    type Step = (u8, u8, Vec<u8>, Result<Vec<u8>, ProtocolError>);
+
+    fn battery(script: Vec<Step>) -> (BatteryStatus, Result<(), ProtocolError>, bool) {
         let mut calls = fake(script);
         let mut status = BatteryStatus::unavailable("test");
         let result = read_battery(&mut calls, &mut status, 42);
@@ -832,7 +832,7 @@ mod tests {
     }
 
     const PING: (u8, u8, [u8; 3], [u8; 3]) = (0, 1, [0, 0, 42], [4, 2, 42]);
-    fn ping_step() -> (u8, u8, Vec<u8>, Result<Vec<u8>, ProtocolError>) {
+    fn ping_step() -> Step {
         (PING.0, PING.1, PING.2.to_vec(), Ok(PING.3.to_vec()))
     }
 
@@ -992,7 +992,7 @@ mod tests {
     use std::collections::VecDeque;
 
     struct Fake {
-        script: VecDeque<(u8, u8, Vec<u8>, Result<Vec<u8>, ProtocolError>)>,
+        script: VecDeque<Step>,
         long: bool,
     }
     impl Calls for Fake {
@@ -1018,7 +1018,7 @@ mod tests {
             self.long
         }
     }
-    fn fake(script: Vec<(u8, u8, Vec<u8>, Result<Vec<u8>, ProtocolError>)>) -> Fake {
+    fn fake(script: Vec<Step>) -> Fake {
         Fake {
             script: script.into(),
             long: true,
