@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { AppWindow, ArrowRight, FileSliders, Keyboard, MousePointerClick, Pencil, Plus, RefreshCw, Search, ShieldAlert, Trash2, X } from "lucide-react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
@@ -17,20 +17,28 @@ import type { Intent } from "@/App";
 import { messageFrom, nativeCommand, utf8Length, type Profile, type RemapStatus, type RunningApp } from "@/lib/bridge";
 import { formatTarget, isModifierKey, isSupportedKey, keyLabel, modifiers, mouseSources, parseTarget, sourceLabel, targetLabel, type Modifier, type Target } from "@/lib/keys";
 import type { Desktop } from "@/lib/use-desktop";
+import { visiblePoll } from "@/lib/visible-poll";
 
 function useRemapStatus(native: boolean) {
   const [status, setStatus] = useState<RemapStatus | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const last = useRef("");
   const load = useCallback(async () => {
     if (!native) return;
-    try { setStatus(await nativeCommand<RemapStatus>("get_remap_status")); } catch {  }
+    try {
+      const next = await nativeCommand<RemapStatus>("get_remap_status");
+      const key = JSON.stringify(next);
+      if (key !== last.current) { last.current = key; setStatus(next); }
+      setError(null);
+    } catch (err) { setError(messageFrom(err)); }
   }, [native]);
+  const update = useCallback((next: RemapStatus) => { last.current = JSON.stringify(next); setStatus(next); }, []);
   useEffect(() => {
     if (!native) return;
     void load();
-    const timer = window.setInterval(() => void load(), 1500);
-    return () => window.clearInterval(timer);
+    return visiblePoll(() => void load(), 1500);
   }, [native, load]);
-  return { status, setStatus, load };
+  return { status, setStatus: update, error, load };
 }
 
 export function Profiles({ desktop, intent, onIntentDone }: { desktop: Desktop; intent?: Intent | null; onIntentDone?: () => void }) {
@@ -49,7 +57,7 @@ export function Profiles({ desktop, intent, onIntentDone }: { desktop: Desktop; 
   return <>
     <PageHeading title="Profiles" description="Remap keys and mouse buttons for all apps or for a specific app."><Button disabled={!desktop.native || !!desktop.busy} onClick={() => setEditor("new")}><Plus data-icon="inline-start" />Create profile</Button></PageHeading>
     <div className="content-stack">
-      <RemapPanel desktop={desktop} status={remap.status} onStatus={remap.setStatus} />
+      <RemapPanel desktop={desktop} status={remap.status} error={remap.error} onRetry={() => void remap.load()} onStatus={remap.setStatus} />
       <div className="list-toolbar"><p>{profiles.length} saved profile{profiles.length === 1 ? "" : "s"}</p><Field className="search-field"><FieldLabel htmlFor="profile-search"><Search aria-hidden="true" />Search profiles</FieldLabel><Input id="profile-search" placeholder="Profile or app" value={query} onChange={event => setQuery(event.target.value)} /></Field></div>
       {filtered.length ? <div className="profiles-grid">{filtered.map(profile => {
         const state = remap.status?.profiles.find(item => item.id === profile.id);
@@ -71,7 +79,7 @@ export function Profiles({ desktop, intent, onIntentDone }: { desktop: Desktop; 
   </>;
 }
 
-function RemapPanel({ desktop, status, onStatus }: { desktop: Desktop; status: RemapStatus | null; onStatus: (status: RemapStatus) => void }) {
+function RemapPanel({ desktop, status, error, onRetry, onStatus }: { desktop: Desktop; status: RemapStatus | null; error: string | null; onRetry: () => void; onStatus: (status: RemapStatus) => void }) {
   const supported = desktop.native && (status?.supported ?? false);
   async function toggle(enabled: boolean) {
     const result = await desktop.run("remap-toggle", () => nativeCommand<RemapStatus>("set_remap_enabled", { enabled }), enabled ? "Remapping turned on." : "Remapping turned off.");
@@ -84,6 +92,7 @@ function RemapPanel({ desktop, status, onStatus }: { desktop: Desktop; status: R
     </CardHeader>
     <CardContent className="remap-panel">
       {!desktop.native ? <Alert><AppWindow /><AlertTitle>Available in the desktop app</AlertTitle><AlertDescription>Remapping requires TrapLink for Windows. Nothing is remapped in this browser preview.</AlertDescription></Alert>
+        : error ? <Alert variant="destructive"><ShieldAlert /><AlertTitle>Couldn't check remapping</AlertTitle><AlertDescription className="flex flex-col gap-3"><span>{error}</span><Button variant="outline" size="sm" onClick={onRetry}><RefreshCw data-icon="inline-start" />Check again</Button></AlertDescription></Alert>
         : status && !status.supported ? <Alert><AppWindow /><AlertTitle>Not supported on this platform</AlertTitle><AlertDescription>{status.reason ?? "Remapping is not supported on this platform yet."}</AlertDescription></Alert>
         : status?.enabled && !status.running ? <Alert variant="destructive"><ShieldAlert /><AlertTitle>Remapping stopped</AlertTitle><AlertDescription>Keyboard and mouse capture is not active. Turn it off and on again to retry.</AlertDescription></Alert>
         : status?.running ? <div className="remap-active">

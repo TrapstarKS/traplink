@@ -839,7 +839,18 @@ pub fn set_enabled(core: &Core, enabled: bool) -> Result<RemapStatus, String> {
         stop();
         return Err(error);
     }
+    clear_resolved_warnings(core);
     Ok(status(core))
+}
+
+/// Prefix of the warning shown when profile changes could not be applied.
+pub const UPDATE_WARNING: &str = "Remapping could not be updated:";
+/// Prefix of the warning shown when remapping could not start at launch.
+pub const START_WARNING: &str = "Remapping could not be turned on:";
+
+/// Drops earlier remapping failures once the current settings applied cleanly.
+pub fn clear_resolved_warnings(core: &Core) {
+    core.clear_warnings(|w| w.starts_with(UPDATE_WARNING) || w.starts_with(START_WARNING));
 }
 
 pub fn emergency_off(core: &Core) {
@@ -858,9 +869,7 @@ pub fn init(core: Arc<Core>) {
         });
     }
     if let Err(error) = apply(&core) {
-        core.warning(format!(
-            "Remapping could not be turned on: {error} It stays off."
-        ));
+        core.warning(format!("{START_WARNING} {error} It stays off."));
         let _ = persist_enabled(&core, false);
         stop();
     }
@@ -1529,5 +1538,18 @@ mod tests {
         round["remapEnabled"] = true.into();
         let back: crate::model::Settings = serde_json::from_value(round).unwrap();
         assert!(back.remap_enabled);
+    }
+
+    #[test]
+    fn toggling_remapping_clears_earlier_remap_failures() {
+        let directory = tempfile::tempdir().unwrap();
+        let core = Core::for_test(directory.path().to_path_buf(), 48372);
+        core.warning(format!("{UPDATE_WARNING} Hook failed."));
+        core.warning(format!("{START_WARNING} Hook failed. It stays off."));
+        core.warning("Cannot listen on LAN port 48372.".into());
+        // Turning remapping off applies cleanly without installing input hooks.
+        set_enabled(&core, false).unwrap();
+        let warnings = core.warnings.lock().unwrap().clone();
+        assert_eq!(warnings, vec!["Cannot listen on LAN port 48372.".to_string()]);
     }
 }

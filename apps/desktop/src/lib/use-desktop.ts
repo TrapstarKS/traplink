@@ -22,8 +22,11 @@ export function useDesktop() {
   const actions = useRef(new Map<symbol, string>());
   const mounted = useRef(true);
 
-  const refresh = useCallback(async (afterCurrent = false) => {
+  // devices: re-enumerate keyboards and mice instead of using the recent list.
+  const refresh = useCallback(async (afterCurrent = false, options?: { devices?: boolean }) => {
     if (!nativeAvailable) return;
+    const devices = !!options?.devices;
+    if (devices) afterCurrent = true;
     if (inFlight.current) {
       await inFlight.current;
       if (!afterCurrent) return;
@@ -33,7 +36,7 @@ export function useDesktop() {
       try {
         const revision = inputRevision.current;
         const [next, input] = await Promise.all([
-          nativeCommand<DesktopSnapshot>("get_snapshot"),
+          nativeCommand<DesktopSnapshot>("get_snapshot", devices ? { refreshDevices: true } : undefined),
           nativeCommand<InputStatus>("get_input_status").catch(() => null),
         ]);
         if (mounted.current) {

@@ -1020,6 +1020,9 @@ pub async fn listen(core: Arc<Core>) {
                 continue;
             }
         };
+        core.clear_warnings(|w| {
+            w.starts_with("Cannot listen on LAN port") || w.starts_with("LAN listener failed")
+        });
         core.listening.store(true, Ordering::Relaxed);
         loop {
             tokio::select! {

@@ -3,7 +3,7 @@ import type { Peer, Profile, Snapshot } from "@traplink/shared";
 
 export type { Backup, Device, KeyMapping, PairingInvite, Platform, Profile, Settings, Snapshot, Transfer } from "@traplink/shared";
 export interface ConnectedPeer extends Peer { flowClipboard?: boolean; permissions?: { clipboard: boolean; files: boolean; input?: boolean } }
-export interface DesktopSnapshot extends Omit<Snapshot, "peers"> { peers: ConnectedPeer[]; warnings?: string[] }
+export interface DesktopSnapshot extends Omit<Snapshot, "peers"> { peers: ConnectedPeer[]; warnings?: string[]; warningsDismissible?: boolean }
 export interface Capabilities {
   cloudBackups?: boolean;
   hidInventory: boolean;
@@ -75,6 +75,10 @@ export function messageFrom(error: unknown): string {
     [/requires HID\+\+ 2|HID\+\+ 1.0/i, "This keyboard uses an HID++ version that doesn't support this control."],
     [/receiver|Unifying|Bolt receiver/i, "This receiver doesn't support direct configuration in this version. Connect a compatible keyboard directly over USB or Bluetooth and try again."],
     [/HID\+\+.*(?:not supported|unsupported)|unsupported.*HID\+\+|function inversion.*(?:not supported|unsupported)|does not support.*Fn/i, "This device doesn't report support for configuring Fn keys through TrapLink."],
+    // Network and session timeouts must match before the generic device timeout below.
+    [/Connection timed out\. Confirm both computers|Connection attempt timed out/i, "Couldn't connect in time. Confirm both computers are on the same network and the firewall allows TrapLink."],
+    [/Input control timed out/i, "The control session ended. Start control again."],
+    [/did not confirm Flow/i, "The other computer didn't confirm Flow in time. Try again."],
     [/timed out|timeout|did not respond/i, "The device didn't respond in time. Check the connection and try again."],
     [/Cannot decrypt this backup/i, "Couldn't open the backup. Check the passphrase and try again."],
     [/passphrase.*12|at least 12 characters/i, "Use a passphrase of at least 12 characters and up to 1024 bytes."],

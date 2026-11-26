@@ -17,6 +17,7 @@ import { BusyIcon, ConfirmDialog, Disclosure, EmptyState, formatBytes, formatted
 import type { Intent } from "@/App";
 import { chooseFile, messageFrom, nativeCommand, type ConnectedPeer, type PairingInvite, type Transfer } from "@/lib/bridge";
 import type { Desktop } from "@/lib/use-desktop";
+import { inviteBaseline, inviteState, type InviteBaseline } from "@/lib/pairing";
 import { allowLocally, revokeForPeer, type PeerFeature } from "@/lib/permissions";
 import { InputControl } from "@/components/InputControl";
 import { FlowControl } from "@/components/FlowControl";
@@ -103,23 +104,41 @@ function PairingDialog({ desktop, open, onOpenChange }: { desktop: Desktop; open
   const busy = !desktop.native || !desktop.capabilities.lanPairing || !!desktop.busy;
   const [now, setNow] = useState(Date.now);
   const remaining = invite ? Math.max(0, Math.ceil((Date.parse(invite.expiresAt) - now) / 1000)) : 0;
-  const inviteAvailable = !!invite && remaining > 0 && desktop.snapshot?.pairingCode === invite.code;
+  const baseline = useRef<InviteBaseline>(inviteBaseline([]));
+  // Judge expiry with the current time, not the once-per-second tick, so a snapshot taken just after expiry is not read as a live invite.
+  const state = invite ? inviteState(invite, desktop.snapshot?.pairingCode, desktop.snapshot?.peers ?? [], baseline.current, Math.max(now, Date.now())) : null;
+  const inviteAvailable = state?.kind === "available";
+  const pairedPeer = state?.kind === "paired" ? state.peer : null;
+  const { refresh } = desktop;
   useEffect(() => {
     if (!invite || !open) return;
     const timer = window.setInterval(() => setNow(Date.now()), 1000);
     return () => window.clearInterval(timer);
   }, [invite, open]);
+  useEffect(() => {
+    // Check sooner than the app-wide poll so the inviting computer sees the pairing promptly.
+    if (!inviteAvailable || !open) return;
+    const timer = window.setInterval(() => { if (!document.hidden) void refresh(); }, 2000);
+    return () => window.clearInterval(timer);
+  }, [inviteAvailable, open, refresh]);
+  useEffect(() => {
+    if (!pairedPeer || !openRef.current) return;
+    // The core already consumed the invite during the handshake, so there is nothing to cancel.
+    activeInvite.current = null;
+    toast.success(`${pairedPeer.name} paired.`);
+    close(false, false);
+  }, [pairedPeer?.id]); // Runs once per paired computer; close only uses refs and stable setters here.
   useEffect(() => () => {
     openRef.current = false;
     window.clearTimeout(copyTimer.current);
     if (activeInvite.current) void nativeCommand("cancel_pairing_invite").catch(error => toast.error(messageFrom(error)));
   }, []);
 
-  function close(next: boolean) {
+  function close(next: boolean, cancelInvite = true) {
     openRef.current = next;
     if (!next) {
       inviteGeneration.current += 1;
-      if (invite) void nativeCommand("cancel_pairing_invite").catch(error => toast.error(messageFrom(error)));
+      if (invite && cancelInvite) void nativeCommand("cancel_pairing_invite").catch(error => toast.error(messageFrom(error)));
       activeInvite.current = null;
       window.clearTimeout(copyTimer.current);
       setInvite(null); setCode(""); setCopied(false); setPairError(null); setInviteError(null);
@@ -131,11 +150,12 @@ function PairingDialog({ desktop, open, onOpenChange }: { desktop: Desktop; open
     const generation = inviteGeneration.current;
     setCopied(false);
     setInviteError(null);
+    const known = inviteBaseline(desktop.snapshot?.peers);
     const result = await desktop.run("invite", async () => {
       try { return await nativeCommand<PairingInvite>("create_pairing_invite"); }
       catch (error) { if (openRef.current && generation === inviteGeneration.current) setInviteError(messageFrom(error)); throw error; }
     });
-    if (result && openRef.current && generation === inviteGeneration.current) { activeInvite.current = result; setInvite(result); setNow(Date.now()); }
+    if (result && openRef.current && generation === inviteGeneration.current) { baseline.current = known; activeInvite.current = result; setInvite(result); setNow(Date.now()); }
     else if (result) await nativeCommand("cancel_pairing_invite").catch(error => toast.error(messageFrom(error)));
   }
   async function pair(event: React.FormEvent) {
