@@ -122,6 +122,11 @@ impl Core {
             }
         }
     }
+    pub fn clear_warning(&self, message: &str) {
+        if let Ok(mut warnings) = self.warnings.lock() {
+            warnings.retain(|warning| warning != message);
+        }
+    }
     pub fn push_transfer(&self, transfer: Transfer) {
         if let Ok(mut transfers) = self.transfers.lock() {
             transfers.insert(0, transfer);
@@ -206,6 +211,10 @@ impl Core {
             .map_err(|_| "Account lock is unavailable.")?
             .as_ref()
             .map(|c| c.account.clone());
+        let account_expired = account.is_none()
+            && warnings
+                .iter()
+                .any(|warning| warning == crate::auth::SIGNED_OUT_MESSAGE);
         Ok(Snapshot {
             device_id: data.device_id,
             device_name: data.settings.device_name.clone(),
@@ -225,6 +234,7 @@ impl Core {
             local_addresses: self.addresses(),
             pairing_code,
             account,
+            account_expired,
             permissions: Permissions {
                 accessibility: false,
                 input_monitoring: false,

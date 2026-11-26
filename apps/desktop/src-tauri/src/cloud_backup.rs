@@ -216,6 +216,20 @@ fn status_error(status: reqwest::StatusCode) -> String {
     }
 }
 
+/// An exact 401 means the server no longer accepts this computer's credential, so forget it.
+/// 403, 5xx and network errors keep the credential.
+fn forget_if_unauthorized(
+    core: &Core,
+    token: &str,
+    response: &reqwest::Response,
+) -> Result<(), String> {
+    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        crate::auth::forget_rejected_credential(core, token);
+        return Err(crate::auth::SIGNED_OUT_MESSAGE.into());
+    }
+    Ok(())
+}
+
 async fn bounded_response(mut response: reqwest::Response, max: usize) -> Result<Vec<u8>, String> {
     if !response.status().is_success() {
         return Err(status_error(response.status()));
@@ -273,6 +287,7 @@ pub async fn save_cloud_backup(
         .send()
         .await
         .map_err(|_| "Cannot reach the cloud backup server.")?;
+    forget_if_unauthorized(core, &account.token, &response)?;
     let bytes = bounded_response(response, 4096).await?;
     let metadata: CloudBackupMetadata =
         serde_json::from_slice(&bytes).map_err(|_| "Invalid cloud backup confirmation.")?;
@@ -306,6 +321,7 @@ pub async fn fetch_cloud_backup(
         .send()
         .await
         .map_err(|_| "Cannot reach the cloud backup server.")?;
+    forget_if_unauthorized(core, &account.token, &response)?;
     let bytes = bounded_response(response, MAX_RESPONSE_JSON).await?;
     let download: DownloadResponse = serde_json::from_slice(&bytes).map_err(|_| DECRYPT_ERROR)?;
     let crypto_guard = CRYPTO_GATE
@@ -330,6 +346,7 @@ pub async fn delete_cloud_backup(core: &Arc<Core>) -> Result<(), String> {
         .send()
         .await
         .map_err(|_| "Cannot reach the cloud backup server.")?;
+    forget_if_unauthorized(core, &account.token, &response)?;
     if !response.status().is_success() {
         return Err(status_error(response.status()));
     }
@@ -434,5 +451,56 @@ mod tests {
         };
         let encoded = serialize_bounded(&envelope, 4096).unwrap();
         assert_eq!(std::str::from_utf8(&encoded).unwrap(), "{\"version\":1,\"algorithm\":\"xchacha20poly1305\",\"salt\":\"salt\",\"nonce\":\"nonce\",\"ciphertext\":\"cipher\"}");
+    }
+
+    fn signed_in(core: &Core, server: &str) {
+        *core.account.lock().unwrap() = Some(crate::identity::Credential {
+            server: server.into(),
+            token: "tlk_test-only-device-token".into(),
+            device_id: uuid::Uuid::new_v4().to_string(),
+            account: crate::model::Account {
+                name: "Test".into(),
+                email: "test@example.com".into(),
+            },
+        });
+    }
+
+    #[tokio::test]
+    async fn unauthorized_cloud_response_forgets_the_rejected_credential() {
+        use crate::auth::test_http;
+        let directory = tempfile::tempdir().unwrap();
+        let core = Core::for_test(directory.path().to_path_buf(), 48372);
+        let installation = core.data.lock().unwrap().device_id.clone();
+        let stub = test_http::serve(vec![test_http::response(
+            "401 Unauthorized",
+            r#"{"error":"unauthorized","message":"This device must sign in again."}"#,
+        )])
+        .await;
+        signed_in(&core, &stub.base);
+        let error = delete_cloud_backup(&core).await.err().unwrap();
+        assert!(error.contains("Sign in again"), "{error}");
+        assert!(core.account.lock().unwrap().is_none());
+        assert!(crate::identity::credential_was_deleted(&installation));
+        assert!(core
+            .warnings
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|warning| warning.contains("expired or was revoked")));
+    }
+
+    #[tokio::test]
+    async fn forbidden_or_unavailable_cloud_responses_keep_the_credential() {
+        use crate::auth::test_http;
+        for status in ["403 Forbidden", "503 Service Unavailable"] {
+            let directory = tempfile::tempdir().unwrap();
+            let core = Core::for_test(directory.path().to_path_buf(), 48372);
+            let installation = core.data.lock().unwrap().device_id.clone();
+            let stub = test_http::serve(vec![test_http::response(status, "{}")]).await;
+            signed_in(&core, &stub.base);
+            assert!(delete_cloud_backup(&core).await.is_err());
+            assert!(core.account.lock().unwrap().is_some(), "{status}");
+            assert!(!crate::identity::credential_was_deleted(&installation));
+        }
     }
 }

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { randomUUID } from 'node:crypto';
 import { isValidDeviceName, registrationSchema } from '../src/server/devices';
-import { deviceNameValid, maxDeviceNameLength } from '../../desktop/src/lib/device-name';
+import { deviceNameValid, maxDeviceNameLength } from '../../../packages/shared/src/device-name';
 
 function register(name: string) {
   return registrationSchema.safeParse({ installationId: randomUUID(), name, platform: 'windows', appVersion: '0.1.11' });

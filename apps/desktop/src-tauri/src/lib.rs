@@ -120,6 +120,14 @@ async fn update_settings(
 ) -> Result<Snapshot, String> {
     let _gate = state.auth_gate.lock().await;
     let mut settings = settings;
+    let previous_name = state
+        .data
+        .lock()
+        .map_err(|_| "Settings lock unavailable.")?
+        .settings
+        .device_name
+        .clone();
+    settings.device_name = model::accept_device_name(&settings.device_name, &previous_name)?;
     settings.validate()?;
     settings.start_on_login = background::set_autostart(&app, settings.start_on_login)?;
     ensure_emergency_shortcut(&app, settings.input_enabled)?;
@@ -271,7 +279,10 @@ fn restore(doc: storage::BackupDocument, core: &Core) -> Result<Snapshot, String
         let mut data = core.data.lock().map_err(|_| "Settings lock unavailable.")?;
         let mut updated = data.clone();
         updated.profiles = doc.profiles;
-        updated.settings.device_name = doc.settings.device_name;
+        // Backups from older versions can hold names the server rejects.
+        if let Some(name) = model::sanitize_device_name(&doc.settings.device_name) {
+            updated.settings.device_name = name;
+        }
         updated.settings.theme = doc.settings.theme;
         updated.settings.clipboard_enabled = false;
         updated.settings.file_sharing_enabled = false;
@@ -306,25 +317,42 @@ fn export_backup(id: String, state: AppState<'_>) -> Result<String, String> {
 }
 #[tauri::command]
 fn export_backup_file(id: String, path: String, state: AppState<'_>) -> Result<(), String> {
-    if !PathBuf::from(&path).is_absolute() {
+    let path = PathBuf::from(path);
+    if !path.is_absolute() {
         return Err("Choose an absolute file path.".into());
     }
-    let doc: storage::BackupDocument =
-        storage::read_document(&storage::backup_path(&state.directory, &id)?)?;
-    doc.validate()?;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
-        .map_err(|e| format!("Cannot export backup (choose a new filename): {e}"))?;
-    use std::io::Write;
-    file.write_all(
-        serde_json::to_string_pretty(&doc)
-            .map_err(|e| e.to_string())?
-            .as_bytes(),
-    )
-    .and_then(|_| file.sync_all())
-    .map_err(|e| e.to_string())
+    // The webview supplies this path, so this legacy command never replaces a file.
+    storage::export_backup(&state.directory, &id, &path, false)
+}
+/// Asks where to save the backup in the native save dialog, then writes it there. The OS
+/// dialog asks before replacing a file, so a confirmed file is replaced atomically. Returns
+/// `false` when the user cancels.
+#[tauri::command]
+async fn save_backup_file(
+    id: String,
+    default_name: Option<String>,
+    state: AppState<'_>,
+) -> Result<bool, String> {
+    let directory = state.directory.clone();
+    storage::read_document::<storage::BackupDocument>(&storage::backup_path(&directory, &id)?)?
+        .validate()?;
+    let destination = tokio::task::spawn_blocking(move || {
+        rfd::FileDialog::new()
+            .add_filter("TrapLink backup", &["json"])
+            .set_file_name(default_name.unwrap_or("traplink-backup.json".into()))
+            .save_file()
+    })
+    .await
+    .map_err(|_| "Save picker failed.")?;
+    let Some(destination) = destination else {
+        return Ok(false);
+    };
+    tokio::task::spawn_blocking(move || {
+        storage::export_backup(&directory, &id, &destination, true)
+    })
+    .await
+    .map_err(|_| "Cannot export backup.")??;
+    Ok(true)
 }
 #[tauri::command]
 fn import_backup_file(path: String, state: AppState<'_>) -> Result<Snapshot, String> {
@@ -638,6 +666,15 @@ fn reopen_login(app: tauri::AppHandle, state: AppState<'_>) -> Result<(), String
 async fn logout(state: AppState<'_>) -> Result<(), String> {
     auth::logout(state.inner().clone()).await
 }
+#[tauri::command]
+async fn list_account_devices(state: AppState<'_>) -> Result<Vec<auth::AccountDevice>, String> {
+    auth::list_devices(state.inner().clone()).await
+}
+/// Returns `true` when the revoked device was this computer, which is now signed out.
+#[tauri::command]
+async fn revoke_account_device(id: String, state: AppState<'_>) -> Result<bool, String> {
+    auth::revoke_device(state.inner().clone(), &id).await
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -665,8 +702,19 @@ pub fn run() {
                 .path()
                 .download_dir()
                 .or_else(|_| app.path().document_dir())?;
-            let core = Core::new(directory, downloads.display().to_string())
-                .map_err(std::io::Error::other)?;
+            let core = match Core::new(directory.clone(), downloads.display().to_string()) {
+                Ok(core) => core,
+                Err(error) => {
+                    // Release builds have no console, so say why TrapLink cannot start.
+                    rfd::MessageDialog::new()
+                        .set_level(rfd::MessageLevel::Error)
+                        .set_title("TrapLink cannot start")
+                        .set_description(storage::startup_failure_message(&error, &directory))
+                        .set_buttons(rfd::MessageButtons::Ok)
+                        .show();
+                    return Err(std::io::Error::other(error).into());
+                }
+            };
             app.manage(core.clone());
             sync_start_on_login(&core, background::autostart_enabled(app.handle()));
             restore_input_on_launch(app.handle(), &core);
@@ -759,7 +807,10 @@ pub fn run() {
             select_file,
             select_folder,
             select_backup_destination,
-            reopen_login
+            reopen_login,
+            list_account_devices,
+            revoke_account_device,
+            save_backup_file
         ])
         .build(tauri::generate_context!())
         .expect("Cannot start TrapLink")

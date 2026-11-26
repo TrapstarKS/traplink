@@ -49,13 +49,46 @@ export async function chooseDirectory(): Promise<string | null> {
   return nativeCommand<string | null>("select_folder");
 }
 
+function backupFileName(name: string): string {
+  return `${name.replace(/[^\p{L}\p{N} _-]/gu, "").slice(0, 80) || "traplink-backup"}.json`;
+}
+
 export async function chooseBackupDestination(name: string): Promise<string | null> {
-  return nativeCommand<string | null>("select_backup_destination", { defaultName: `${name.replace(/[^\p{L}\p{N} _-]/gu, "").slice(0, 80) || "traplink-backup"}.json` });
+  return nativeCommand<string | null>("select_backup_destination", { defaultName: backupFileName(name) });
+}
+
+/** Opens the native save dialog and writes the backup there. Resolves false when cancelled. */
+export function saveBackupFile(id: string, name: string): Promise<boolean> {
+  return nativeCommand<boolean>("save_backup_file", { id, defaultName: backupFileName(name) });
+}
+
+export interface AccountDevice {
+  id: string;
+  name: string;
+  platform: "windows" | "macos" | "unknown";
+  appVersion: string;
+  createdAt: string;
+  lastSeenAt: string;
+  expiresAt: string;
+  revokedAt: string | null;
+  current: boolean;
+}
+
+export function listAccountDevices(): Promise<AccountDevice[]> {
+  return nativeCommand<AccountDevice[]>("list_account_devices");
+}
+
+/** Resolves true when the revoked device was this computer, which is then signed out. */
+export function revokeAccountDevice(id: string): Promise<boolean> {
+  return nativeCommand<boolean>("revoke_account_device", { id });
 }
 
 export function messageFrom(error: unknown): string {
   const text = typeof error === "string" ? error : error instanceof Error ? error.message : "";
   const known: Array<[RegExp, string]> = [
+    [/sign-in expired or was revoked/i, "This computer's sign-in expired or was revoked. Sign in again."],
+    [/no longer on your account/i, "This device is no longer on your account. Refresh the list."],
+    [/Device name must contain .*without control characters/i, "Use a computer name with 1 to 80 characters, without tabs or line breaks."],
     [/invitation.*expired|invitation was cancelled or expired/i, "This invitation expired or was cancelled. Create a new one on the computer you want to connect."],
     [/invitation version is not supported/i, "Update TrapLink on both computers and create a new invitation."],
     [/invitation expiry is invalid/i, "Check the date and time on both computers and create a new invitation."],

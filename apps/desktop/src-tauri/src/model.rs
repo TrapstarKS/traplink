@@ -75,6 +75,47 @@ impl Settings {
         Ok(())
     }
 }
+/// Longest device name, in Unicode code points. The server and the Preferences form use
+/// the same limit (apps/web/src/server/devices.ts, apps/desktop/src/lib/device-name.ts).
+pub const MAX_DEVICE_NAME_CHARS: usize = 80;
+
+/// Trims like JavaScript `String.prototype.trim`, which the server applies before it checks
+/// the name. Rust `str::trim` also strips U+0085 and keeps U+FEFF, so it is not used here.
+pub fn trim_device_name(name: &str) -> &str {
+    name.trim_matches(|c: char| (c.is_whitespace() && c != '\u{85}') || c == '\u{feff}')
+}
+
+/// The device-name rule shared with the server: after trimming, 1 to 80 code points and no
+/// control characters (Unicode category Cc). Returns the trimmed name to store.
+pub fn validate_device_name(name: &str) -> Result<&str, String> {
+    let name = trim_device_name(name);
+    let length = name.chars().count();
+    if length == 0 || length > MAX_DEVICE_NAME_CHARS || name.chars().any(char::is_control) {
+        return Err("Device name must contain 1–80 characters without control characters.".into());
+    }
+    Ok(name)
+}
+
+/// Turns a stored or restored name into one the server accepts, or `None` when nothing usable
+/// is left. Older versions allowed tabs and other control characters.
+pub fn sanitize_device_name(name: &str) -> Option<String> {
+    let cleaned: String = name.chars().filter(|c| !c.is_control()).collect();
+    let cleaned: String = trim_device_name(&cleaned)
+        .chars()
+        .take(MAX_DEVICE_NAME_CHARS)
+        .collect();
+    let cleaned = trim_device_name(&cleaned);
+    (!cleaned.is_empty()).then(|| cleaned.to_owned())
+}
+
+/// The name to store when the user saves Preferences. A changed name must follow the shared
+/// rule; an unchanged one is kept, so settings from older versions can still be saved.
+pub fn accept_device_name(name: &str, previous: &str) -> Result<String, String> {
+    if name == previous {
+        return Ok(name.to_owned());
+    }
+    validate_device_name(name).map(str::to_owned)
+}
 pub fn validate_server_url(value: &str) -> Result<url::Url, String> {
     let parsed = url::Url::parse(value).map_err(|_| "Enter a valid authentication server URL.")?;
     let local = matches!(
@@ -273,6 +314,8 @@ pub struct Snapshot {
     pub local_addresses: Vec<String>,
     pub pairing_code: Option<String>,
     pub account: Option<Account>,
+    /// The server rejected this computer's credential, so it was signed out.
+    pub account_expired: bool,
     pub permissions: Permissions,
     pub warnings: Vec<String>,
 }
@@ -319,5 +362,68 @@ impl Persisted {
         let before = self.flow_peers.len();
         self.flow_peers.retain(|f| f.peer != peer);
         self.flow_peers.len() != before
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Same table as apps/web/tests/device-name.test.ts, so both sides agree.
+    #[test]
+    fn device_name_rule_matches_the_server() {
+        let emoji80 = "\u{1f5a5}".repeat(80);
+        let mixed = format!("{}\u{1f3ae}", "a".repeat(79));
+        let a80 = "a".repeat(80);
+        let a81 = "a".repeat(81);
+        let emoji81 = "\u{1f5a5}".repeat(81);
+        let cases: [(&str, bool); 17] = [
+            ("Work PC", true),
+            ("  Work PC  ", true),
+            ("\tWork PC\n", true),
+            ("\u{feff}Work PC", true),
+            (&a80, true),
+            (&mixed, true),
+            (&emoji80, true),
+            (&a81, false),
+            (&emoji81, false),
+            ("", false),
+            ("   ", false),
+            ("\u{3000}", false),
+            ("Work\tPC", false),
+            ("Work\u{0}PC", false),
+            ("Work\u{7f}PC", false),
+            ("\u{85}Work PC", false),
+            ("Work\u{9f}PC", false),
+        ];
+        for (name, valid) in cases {
+            assert_eq!(validate_device_name(name).is_ok(), valid, "{name:?}");
+        }
+        assert_eq!(validate_device_name("  Studio Mac  "), Ok("Studio Mac"));
+    }
+
+    #[test]
+    fn stored_names_are_cleaned_before_registration() {
+        assert_eq!(sanitize_device_name("Work\tPC").as_deref(), Some("WorkPC"));
+        assert_eq!(sanitize_device_name(" \u{7}  ").as_deref(), None);
+        let long = format!("{} b", "a".repeat(79));
+        assert_eq!(sanitize_device_name(&long), Some("a".repeat(79)));
+        let clean = sanitize_device_name(&"\u{1f5a5}".repeat(90)).unwrap();
+        assert!(validate_device_name(&clean).is_ok());
+    }
+
+    #[test]
+    fn preferences_reject_new_names_the_server_would_reject() {
+        assert!(accept_device_name("PC\tHome", "My computer").is_err());
+        assert!(accept_device_name("Home\u{9f}", "My computer").is_err());
+        assert_eq!(
+            accept_device_name("  Home PC  ", "My computer").as_deref(),
+            Ok("Home PC")
+        );
+        // A name stored by an older version can still be kept while other settings change.
+        assert_eq!(
+            accept_device_name("PC\tHome", "PC\tHome").as_deref(),
+            Ok("PC\tHome")
+        );
     }
 }
